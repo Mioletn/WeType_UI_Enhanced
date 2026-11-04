@@ -47,11 +47,16 @@ final class LegacyEmulationController {
         return (docs as NSString).appendingPathComponent("husk-phase0-serial.log")
     }()
 
-    /// The guest console as a byte stream. Kept in NSTemporaryDirectory() rather
-    /// than Documents because a Unix socket path must fit in sun_path (104 bytes
-    /// on Darwin) and the app's container path alone is already ~75.
+    /// The guest console as a byte stream.
+    ///
+    /// QEMU refuses a Unix socket path that is not "less than 104 bytes", and on
+    /// device the container resolves to /private/var/mobile/Containers/Data/
+    /// Application/<UUID>/tmp/ -- about 89 bytes before the file name. So the
+    /// file name has to stay tiny: "hs.sock" leaves ~8 bytes of headroom.
+    /// (Measured on device: the descriptive name "husk-serial.sock" came to 105
+    /// and qemu_init exited with "UNIX socket path ... is too long".)
     let serialSocketPath: String = (NSTemporaryDirectory() as NSString)
-        .appendingPathComponent("husk-serial.sock")
+        .appendingPathComponent("hs.sock")
 
     private lazy var serial = LegacySerialLink(socketPath: serialSocketPath,
                                                logPath: serialLogPath)
@@ -65,6 +70,11 @@ final class LegacyEmulationController {
 
     func start() {
         guard !isRunning else { return }
+
+        // QEMU's limit is < 104 bytes for sun_path; log the real figure so a
+        // container-path change surfaces here instead of as a qemu_init exit.
+        HuskLog.log("emu", "serial socket path (\(serialSocketPath.utf8.count) bytes, "
+                         + "limit 103): \(serialSocketPath)")
 
         // 1. Trap guard: an unserviced brk must return 0, not kill the process.
         husk_ios_jit_install_trap_handler()

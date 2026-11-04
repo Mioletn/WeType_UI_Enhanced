@@ -16,6 +16,7 @@ final class LegacyEmulationViewController: UIViewController {
     private let stopButton = UIButton(type: .system)
     private let imageView = UIImageView()
     private let logView = UITextView()
+    private let inputField = UITextField()
     private let spinner = UIActivityIndicatorView(style: .white)
 
     private var frameTimer: Timer?
@@ -49,7 +50,7 @@ final class LegacyEmulationViewController: UIViewController {
         statusLabel.text = "Idle"
         statusLabel.textAlignment = .center
 
-        startButton.setTitle("Start Android (QEMU)", for: .normal)
+        startButton.setTitle("Start guest (QEMU)", for: .normal)
         startButton.titleLabel?.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
         startButton.addTarget(self, action: #selector(startTapped), for: .touchUpInside)
 
@@ -70,6 +71,26 @@ final class LegacyEmulationViewController: UIViewController {
         imageView.layer.borderColor = LegacyUI.surfaceHigh.cgColor
         imageView.layer.borderWidth = 1
         imageView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        imageView.isUserInteractionEnabled = true
+        imageView.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(imageTapped(_:))))
+
+        // Keystrokes never accumulate here: the delegate forwards each one to the
+        // guest and refuses the edit, so this is an input surface, not a text box.
+        inputField.backgroundColor = LegacyUI.surface
+        inputField.textColor = LegacyUI.text
+        inputField.tintColor = LegacyUI.accent
+        inputField.font = huskMonospacedFont(ofSize: 13, weight: .regular)
+        inputField.placeholder = "Tap here, then type into the guest console"
+        inputField.autocorrectionType = .no
+        inputField.autocapitalizationType = .none
+        inputField.spellCheckingType = .no
+        inputField.keyboardType = .asciiCapable
+        inputField.returnKeyType = .default
+        inputField.delegate = self
+        inputField.layer.cornerRadius = 8
+        inputField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 1))
+        inputField.leftViewMode = .always
 
         logView.backgroundColor = LegacyUI.surface
         logView.textColor = LegacyUI.textDim
@@ -80,7 +101,8 @@ final class LegacyEmulationViewController: UIViewController {
         logView.layer.cornerRadius = 8
         logView.text = "Guest serial console will appear here once QEMU starts."
 
-        let vstack = UIStackView(arrangedSubviews: [statusLabel, buttonRow, imageView, logView])
+        let vstack = UIStackView(arrangedSubviews: [statusLabel, buttonRow,
+                                                    imageView, inputField, logView])
         vstack.axis = .vertical
         vstack.spacing = 12
         vstack.alignment = .fill
@@ -94,6 +116,7 @@ final class LegacyEmulationViewController: UIViewController {
             vstack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             vstack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             logView.heightAnchor.constraint(equalToConstant: 160),
+            inputField.heightAnchor.constraint(equalToConstant: 40),
         ])
     }
 
@@ -181,5 +204,50 @@ final class LegacyEmulationViewController: UIViewController {
             statusLabel.textColor = LegacyUI.text
             spinner.stopAnimating()
         }
+    }
+
+    /// A tap on the guest framebuffer becomes a click in guest pixels. The image
+    /// is aspect-fitted, so the letterbox bars have to be undone first.
+    @objc private func imageTapped(_ g: UITapGestureRecognizer) {
+        guard let img = imageView.image else { return }
+        let bounds = imageView.bounds
+        let iw = img.size.width, ih = img.size.height
+        guard bounds.width > 0, bounds.height > 0, iw > 0, ih > 0 else { return }
+
+        let scale = min(bounds.width / iw, bounds.height / ih)
+        let ox = (bounds.width - iw * scale) / 2
+        let oy = (bounds.height - ih * scale) / 2
+        let p = g.location(in: imageView)
+
+        let gx = (p.x - ox) / scale
+        let gy = (p.y - oy) / scale
+        guard gx >= 0, gy >= 0, gx < iw, gy < ih else { return }
+
+        LegacyEmulationController.shared.sendClick(guestX: Int(gx), guestY: Int(gy))
+    }
+}
+
+// MARK: - keystrokes -> guest
+
+extension LegacyEmulationViewController: UITextFieldDelegate {
+
+    /// Every edit is refused and forwarded instead, so the field stays empty and
+    /// the guest sees exactly the bytes that were typed (paste included).
+    func textField(_ textField: UITextField,
+                   shouldChangeCharactersIn range: NSRange,
+                   replacementString string: String) -> Bool {
+        if string.isEmpty {
+            // Backspace arrives as a deletion with no replacement text. A terminal
+            // sends DEL (0x7f) for erase, not a cursor key.
+            LegacyEmulationController.shared.typeText("\u{7f}")
+            return false
+        }
+        LegacyEmulationController.shared.typeText(string)
+        return false
+    }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        LegacyEmulationController.shared.typeText("\r")
+        return false
     }
 }

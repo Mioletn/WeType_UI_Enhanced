@@ -113,7 +113,7 @@ final class LegacySerialLink {
         guard readerThread == nil, fd >= 0 else { return }
 
         if !FileManager.default.fileExists(atPath: logPath) {
-            FileManager.default.createFile(atPath: logPath, contents: nil)
+            _ = FileManager.default.createFile(atPath: logPath, contents: nil)
         }
         guard let fh = FileHandle(forWritingAtPath: logPath) else {
             HuskLog.log("emu", "serial mirror: cannot open \(logPath)")
@@ -129,14 +129,15 @@ final class LegacySerialLink {
                     Darwin.read(self.fd, p.baseAddress, p.count)
                 }
                 if n > 0 {
-                    fh.write(Data(bytes: buf, count: n))
+                    fh.write(Data(buf[0..<n]))
                     fh.synchronizeFile()
                 } else {
                     // 0 = guest closed, <0 = error. Either way, stop.
                     break
                 }
             }
-            try? fh.close()
+            // closeFile(), not close(): FileHandle.close() is iOS 13+.
+            fh.closeFile()
             HuskLog.log("emu", "serial mirror stopped")
         }
         t.name = "husk.emu.serial"

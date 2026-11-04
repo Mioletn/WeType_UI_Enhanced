@@ -1,0 +1,98 @@
+// swift-interface-format-version: 1.0
+// swift-compiler-version: Apple Swift version 6.4 effective-5.10 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)
+// swift-module-flags: -target arm64-apple-ios17.4 -enable-objc-interop -enable-library-evolution -language-mode 5 -O -enable-experimental-feature DebugDescriptionMacro -enable-bare-slash-regex -module-name StikJIT
+// swift-module-flags-ignorable: -no-verify-emitted-module-interface -formal-cxx-interoperability-mode=off -interface-compiler-version 6.4
+import Foundation
+import JavaScriptCore
+import Network
+import Swift
+import _Concurrency
+import _StringProcessing
+import _SwiftConcurrencyShims
+public struct DDIPaths : Sendable {
+  public var imagePath: String
+  public var trustcachePath: String
+  public var manifestPath: String
+  public var cryptexInfoPath: String
+  public var rootHashPath: String
+  public init(imagePath: String, trustcachePath: String, manifestPath: String, cryptexInfoPath: String? = nil, rootHashPath: String? = nil)
+  public static func `default`(in directory: URL) -> DDIPaths
+}
+@available(iOS 17.4, *)
+public actor DeveloperDiskImageService {
+  public static var shared: DeveloperDiskImageService {
+    get
+  }
+  public init(session: URLSession = .shared)
+  public func downloadIfNeeded(to paths: DDIPaths, progress: @escaping (Double, String) -> Void = { _, _ in }) async throws
+  public func download(to paths: DDIPaths, progress: @escaping (Double, String) -> Void = { _, _ in }) async throws
+  @objc deinit
+  @_semantics("defaultActor") nonisolated final public var unownedExecutor: UnownedSerialExecutor {
+    get
+  }
+}
+public enum StikJIT {
+  public enum Script : Sendable {
+    case universal
+    case legacy
+    case custom(URL)
+    case customBase64(String)
+  }
+  public struct DeviceSecurityState : Sendable {
+    public let isTXMPresent: Bool?
+    public init(isTXMPresent: Bool?)
+  }
+  public enum PreparationStage : Sendable {
+    case checkingReachability
+    case checkingDDI
+    case downloadingDDI(fraction: Double, status: String)
+    case mountingDDI(fraction: Double)
+    case verifyingDDI
+    case ready
+  }
+  public enum JITReadiness : Sendable {
+    case unreachable(reason: String)
+    case preparationFailed(reason: String)
+    case ready(StikJIT.DeviceSecurityState)
+    public var isReady: Bool {
+      get
+    }
+  }
+  public struct Configuration : Sendable {
+    public var deviceAddress: String
+    public var rsdPort: UInt16
+    public var connectionTimeout: TimeInterval
+    public init(deviceAddress: String = "10.7.0.1", rsdPort: UInt16 = 49152, connectionTimeout: TimeInterval = 5)
+    public static var `default`: StikJIT.Configuration {
+      get
+    }
+  }
+  @available(*, deprecated, message: "Use enableJIT with ddiPaths to prepare the device before enabling JIT.")
+  public static func enableJIT(targetPID: Int32, pairingFile: URL, configuration: StikJIT.Configuration = .default, script: StikJIT.Script = .universal, forceScript: Bool = false, progress: @escaping (String) -> Void = { _ in }) throws
+  public static func enableJIT(targetPID: Int32, pairingFile: URL, ddiPaths: DDIPaths, configuration: StikJIT.Configuration = .default, script: StikJIT.Script = .universal, forceScript: Bool = false, preparationProgress: @escaping (StikJIT.PreparationStage) -> Void = { _ in }, progress: @escaping (String) -> Void = { _ in }) throws
+  public static var isTXMPresent: Bool? {
+    get
+  }
+  public static func prepareDevice(pairingFile: URL, paths: DDIPaths, configuration: StikJIT.Configuration = .default, progress: @escaping (StikJIT.PreparationStage) -> Void = { _ in }) -> StikJIT.JITReadiness
+  public static func resetCachedDDI(at paths: DDIPaths) throws
+  public static func isDDIMounted(pairingFile: URL, configuration: StikJIT.Configuration = .default) throws -> Bool
+  @available(iOS 17.4, *)
+  public static func downloadDDIIfNeeded(to paths: DDIPaths, progress: @escaping (Double, String) -> Void = { _, _ in }) async throws
+  public static func mountDDI(pairingFile: URL, configuration: StikJIT.Configuration = .default, paths: DDIPaths, progress: @escaping (Double) -> Void = { _ in }) throws
+}
+public enum StikJITError : Error, LocalizedError {
+  case pairingFile(String)
+  case scriptUnavailable
+  case debugProxyUnavailable
+  case device(code: Int32, subCode: Int32, message: String)
+  case ddiDownload(String)
+  case ddiFilesMissing(String)
+  case ddiNotMounted
+  case deviceNotReady(String)
+  case txmDetectionUnavailable
+  case customScript(String)
+  case scriptExecution(String)
+  public var errorDescription: String? {
+    get
+  }
+}

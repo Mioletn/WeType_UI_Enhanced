@@ -1,0 +1,165 @@
+# Build the iOS 12.2 backport IPA on a GitHub-hosted macOS runner.
+#
+# Why this file exists: the backport targets iOS 12.2, which cannot be built or
+# run from this project's usual development machine (Windows), and -- more to
+# the point -- cannot be built with Xcode 26: binaries from Xcode 26 abort at
+# launch on iOS 12 before didFinishLaunchingWithOptions (Apple feedback thread
+# 829511; the same project launches fine when built with Xcode 16). The runner
+# image pins Xcode 16.4 (Swift 6.1), the newest toolchain whose binaries still
+# launch on iOS 12, with the iOS 18.4 SDK.
+#
+# The build itself is the upstream pipeline (scripts/ci_build.sh): fetch
+# sources, cross-compile QEMU + ANGLE + MoltenVK + the Rust pairing library,
+# then package_ipa.sh (xcodebuild, ad-hoc sign, validate, zip). Everything the
+# iOS 12.2 backport changed for CI lives in those scripts -- see
+# docs/90-ios12-backport.md.
+#
+# Outputs: the IPA and the TrollStore .tipa are attached both as a workflow
+# artifact and to a release tagged ios12-<sha>. On a public repository the
+# release asset downloads without authentication.
+name: build-ipa
+
+# husk-ios12-build is the temporary build branch: this project is normally
+# developed on Windows and the iOS 12.2 IPA must be produced on a macOS runner,
+# so the branch is pushed (content-identical to ios12-backport) to whichever
+# repository can host the Actions run, and deleted once the IPA is retrieved.
+on:
+  push:
+    branches: [ios12-backport, husk-ios12-build]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain facts
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h /
+
+      - name: Select Xcode 16.4
+        # Xcode 26 binaries do not launch on iOS 12; 16.4 is the default on
+        # this image, but select it explicitly so a future image default
+        # cannot silently produce an IPA that crashes at launch.
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version
+          test "$(xcodebuild -version | head -1 | awk '{print $2}')" = "16.4" \
+            || { echo "Xcode 16.4 not selected"; exit 1; }
+
+      - name: Install build dependencies
+        run: |
+          brew install meson ninja pkg-config cmake xcodegen qemu
+          rustup target add aarch64-apple-ios
+
+          # virglrenderer vendors mesa's gallium build files, and those parse
+          # YAML with the `yaml` module at configure time; without it meson
+          # aborts with "src/gallium/meson.build:72:16: ERROR:
+          # /opt/homebrew/bin/python3 is missing modules: yaml". Homebrew's
+          # python3 is PEP 668 externally managed, so prefer the formula and
+          # fall back to pip only with --break-system-packages.
+          /opt/homebrew/bin/python3 -c 'import yaml' 2>/dev/null \
+            || brew install pyyaml \
+            || /opt/homebrew/bin/python3 -m pip install --break-system-packages pyyaml
+          /opt/homebrew/bin/python3 -c 'import yaml; print("pyyaml", yaml.__version__)'
+
+      - name: Restore the Java runtime payload
+        # Java apps (plain DEX apps, libGDX, Flutter) boot from java-runtime/,
+        # which comes out of the Android guest disk, not out of a compiler. It
+        # is the same for every build of the same image, so keep it.
+        uses: actions/cache@v4
+        with:
+          path: build/java-runtime
+          key: java-runtime-a8dbaecc
+
+      - name: Java runtime payload
+        # Not fatal: without it the app still builds and reports, in the library
+        # and in the log, that this build ships no Java runtime.
+        continue-on-error: true
+        run: |
+          if [ -d build/java-runtime ]; then
+            echo "java-runtime restored from cache:"; du -sh build/java-runtime
+            exit 0
+          fi
+          brew install e2fsprogs
+          IMG="$RUNNER_TEMP/vda-v12.qcow2"
+          curl -fL --retry 3 -o "$IMG" \
+            "https://github.com/Leviidev/Husk/releases/download/lineage-v2/vda-v12.qcow2"
+          echo "a8dbaecc8fdcd682991b078d6bbb7df6972e459208634fa8dcbad24f17208d6a  $IMG" \
+            | shasum -a 256 -c -
+          bash ./scripts/extract_java_runtime.sh "$IMG"
+          rm -f "$IMG"
+
+      - name: Husk's Java framework dex
+        # The cache above is keyed on the system image, but it also holds
+        # husk-framework.dex -- and that one comes from src/java-framework, not
+        # from the image. Rebuilding it here is what makes a change to the
+        # framework (a View, a Native, a Resource) reach the IPA at all; the
+        # cache only pins an old copy otherwise.
+        run: |
+          [ -d build/java-runtime ] || { echo "no runtime: the dex came with it"; exit 0; }
+          R8=build/tools/r8.jar
+          [ -f "$R8" ] || { mkdir -p build/tools; curl -fsSL \
+            "https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.5.35/r8-8.5.35.jar" -o "$R8"; }
+          JDK="$(/usr/libexec/java_home)"
+          HUSK_JDK="$JDK" HUSK_D8="$R8" bash src/java-framework/build.sh build/java-runtime/husk-framework.dex
+          ls -l build/java-runtime/husk-framework.dex
+
+      - name: Build the IPA
+        run: ./scripts/ci_build.sh "$GITHUB_WORKSPACE/build/Husk.ipa"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          cp -a build/logs/. "$RUNNER_TEMP/logs/" 2>/dev/null || true
+          cp /tmp/husk_ipa/build.log "$RUNNER_TEMP/logs/" 2>/dev/null || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Husk-ios12-ipa
+          # build/logs is where each stage's compiler output goes; a red run
+          # without it only says "[FAIL] qemu" and the cause stays on the runner.
+          path: |
+            build/Husk.ipa
+            build/Husk.tipa
+            build/logs/**
+          if-no-files-found: warn
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="ios12-$(git rev-parse --short HEAD)"
+          gh release create "$TAG" \
+            build/Husk.ipa build/Husk.tipa \
+            --title "Husk for iOS 12.2 — $TAG" \
+            --notes "$(cat <<'EOF'
+          Backport build of Leviidev/Husk with deployment target iOS 12.2.
+
+          - **Husk.ipa** — install with AltStore / SideStore / Sideloadly (all support iOS 12.2).
+          - **Husk.tipa** — for TrollStore (TrollStore itself does not run on iOS 12; use the .ipa there).
+
+          On iOS 12.2 the app runs its UIKit shell (Library / JIT / Settings) and the native
+          runtime (Unity, cocos2d-x, Minecraft, SDL, Godot, GTA, GameMaker): games draw into a
+          CAMetalLayer through the ANGLE build the app carries, on the CPU path or the runtime.
+          The SwiftUI interface, web apps (Capacitor / Cordova), Unreal games (MoltenVK is iOS 15)
+          and QEMU guest emulation need iOS 13/15+ and are not offered on 12.2. JIT on iOS 12
+          needs a debugger attached (ios-deploy / debugserver) or a jailbreak — see the JIT tab.
+
+          Built with Xcode 16.4 (Xcode 26 binaries abort at launch on iOS 12). See
+          docs/90-ios12-backport.md in the repository for the full backport notes.
+          EOF
+          )" \
+            --target "$GITHUB_SHA"

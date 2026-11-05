@@ -61,6 +61,19 @@ final class LegacyEmulationController {
     private lazy var serial = LegacySerialLink(socketPath: serialSocketPath,
                                                logPath: serialLogPath)
 
+    /// Boot initramfs. If the host built one that carries a real Alpine root
+    /// filesystem inside it (build_root_initramfs.py), it lives in Documents and
+    /// is preferred: the guest then boots into an actual userland with apk
+    /// instead of the stock diskless init's emergency shell. Falling back to the
+    /// bundle's initramfs keeps the shipped Phase 0 path working when it is absent.
+    private var rootInitrdPath: String {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                       .userDomainMask, true)[0]
+        let candidate = (docs as NSString).appendingPathComponent("husk-root-initramfs.gz")
+        if FileManager.default.fileExists(atPath: candidate) { return candidate }
+        return "\(Bundle.main.bundlePath)/initramfs-virt"
+    }
+
     /// JIT region size, in bytes. Must match tb-size in the command line below
     /// so QEMU takes the whole prewarmed region instead of asking for a second
     /// one (which, with no debugger attached, can never be granted).
@@ -124,16 +137,18 @@ final class LegacyEmulationController {
             "-accel", "tcg,tb-size=256,thread=multi,split-wx=on",
 
             "-kernel", "\(bundle)/vmlinuz-virt",
-            "-initrd", "\(bundle)/initramfs-virt",
+            "-initrd", rootInitrdPath,
             // ttyAMA0 is listed LAST on purpose: the kernel binds /dev/console to
             // the last console= given, so the shell runs on the serial port --
             // the one channel we can feed input into. printk still goes to tty0
             // as well, so boot messages also appear on the framebuffer.
             "-append", "console=tty0 console=ttyAMA0 loglevel=8",
 
-            // No network needed for Phase 0; dropping the default virtio-net-pci
-            // avoids a missing-ROM aborts we have already hit once.
-            "-nic", "none",
+            // User-mode networking (SLIRP lives inside QEMU, so it needs no host
+            // privileges). This is what lets a real root run `apk add`: the guest
+            // gets 10.0.2.x over DHCP and NAT out. The PXE option ROM that once
+            // aborted this path is bundled in pc-bios, which -L points at.
+            "-nic", "user,model=virtio-net-pci",
             "-L", "\(bundle)/pc-bios",
 
             // Graphics + input devices. The software display listens on console 0.
@@ -159,8 +174,13 @@ final class LegacyEmulationController {
             "-d", "guest_errors,unimp",
         ]
 
-        // Confirm the guest images are in the bundle before QEMU opens them.
-        for p in ["\(bundle)/vmlinuz-virt", "\(bundle)/initramfs-virt"] {
+        // Confirm the guest images are where QEMU will look for them, and say
+        // which initramfs won -- bundle (Phase 0 shell) or Documents (real root).
+        let initrd = rootInitrdPath
+        let usingRoot = initrd != "\(bundle)/initramfs-virt"
+        HuskLog.log("emu", "initramfs: \(usingRoot ? "root filesystem image" : "bundled Phase 0") "
+                         + "-> \(initrd)")
+        for p in ["\(bundle)/vmlinuz-virt", initrd] {
             let ok = FileManager.default.fileExists(atPath: p)
             HuskLog.log("emu", "needs \(((p as NSString).lastPathComponent)): "
                             + (ok ? "present" : "MISSING"))

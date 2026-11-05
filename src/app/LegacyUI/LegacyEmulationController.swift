@@ -330,7 +330,11 @@ final class LegacyEmulationController {
         // On failure the token is downgraded to the 2D device and the software
         // display takes over, which is the same rule QemuRunner follows.
         var glSurfaceUp = false
-        if args.contains("virtio-gpu-gl-pci") {
+        // Prefix, not equality: the device string may carry options
+        // ("virtio-gpu-gl-pci,xres=800,yres=600"), and matching the bare token
+        // would silently skip GL -- then QEMU gets a GL console with no GL
+        // listener and aborts.
+        if let glIndex = args.firstIndex(where: { $0.hasPrefix("virtio-gpu-gl-pci") }) {
             var created = false
             DispatchQueue.main.sync {
                 if let (layer, size) = LegacyGLView.prepareSurface() {
@@ -345,7 +349,7 @@ final class LegacyEmulationController {
                 // devices are created inside qemu_init().
                 _ = husk_display_gl_early()
             } else {
-                args = args.map { $0 == "virtio-gpu-gl-pci" ? "virtio-gpu-pci" : $0 }
+                args[glIndex] = "virtio-gpu-pci"
                 HuskLog.log("emu", "downgraded to virtio-gpu-pci; software display")
             }
         }

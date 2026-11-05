@@ -42,6 +42,11 @@ final class LegacyEmulationController {
     /// starts -- which is *before* qemu_init runs.
     private(set) var qemuReady = false
 
+    /// The GL display is registered and virgl is rendering into the Metal layer.
+    /// When true there is no CPU framebuffer to pump: frames arrive through the
+    /// Metal presenter, so grabFrame() has nothing to offer.
+    private(set) var glActive = false
+
     /// `<Documents>/husk-boot.args`: an optional QEMU command line, one token per
     /// line, that replaces the built-in Alpine profile.
     ///
@@ -55,6 +60,15 @@ final class LegacyEmulationController {
                                                        .userDomainMask, true)[0]
         return (docs as NSString).appendingPathComponent("husk-boot.args")
     }()
+
+    /// Whether the profile in force asks for the GPU device. The screen uses it
+    /// to show the GL surface before Start, because an EGL window surface cannot
+    /// be built against a layer that is not on screen yet.
+    var bootWantsGL: Bool {
+        guard let text = try? String(contentsOfFile: bootArgsPath, encoding: .utf8)
+        else { return false }
+        return text.contains("virtio-gpu-gl-pci")
+    }
 
     /// Where the guest's serial console output is mirrored. The VC tails this
     /// file, so it is the in-app terminal view as well as the on-disk record.
@@ -129,6 +143,10 @@ final class LegacyEmulationController {
 
     func start() {
         guard !isRunning else { return }
+        // A previous run's GL state does not survive qemu_cleanup: the console
+        // and its listener are gone, so this must start false and be set again
+        // only if bind() succeeds.
+        glActive = false
 
         // QEMU's limit is < 104 bytes for sun_path; log the real figure so a
         // container-path change surfaces here instead of as a qemu_init exit.
@@ -221,7 +239,7 @@ final class LegacyEmulationController {
         let bundle = Bundle.main.bundlePath
         let rootDisk = ensureRootDisk()
         let custom = customBootArguments(bundle: bundle)
-        let args: [String] = custom ?? [
+        var args: [String] = custom ?? [
             "qemu-system-aarch64",
             "-M", "virt",
             "-cpu", "cortex-a72",
@@ -304,6 +322,34 @@ final class LegacyEmulationController {
                              + "formats it with mkfs.ext4)")
         }
 
+        // GL, when the profile asks for it -- and the order below is not
+        // negotiable. A console created for virtio-gpu-gl REQUIRES a GL listener;
+        // if none registers, QEMU aborts the process with "The console requires a
+        // GL context" rather than falling back. So the EGL surface is built
+        // first, and the GL device is only claimed once that is known to work.
+        // On failure the token is downgraded to the 2D device and the software
+        // display takes over, which is the same rule QemuRunner follows.
+        var glSurfaceUp = false
+        if args.contains("virtio-gpu-gl-pci") {
+            var created = false
+            DispatchQueue.main.sync {
+                if let (layer, size) = LegacyGLView.prepareSurface() {
+                    created = husk_display_gl_create(layer, Int32(size.width),
+                                                     Int32(size.height))
+                }
+            }
+            glSurfaceUp = created
+            HuskLog.log("emu", "GL surface: \(created ? "created" : "FAILED")")
+            if created {
+                // Sets display_opengl so virtio-gpu-gl is allowed to realize;
+                // devices are created inside qemu_init().
+                _ = husk_display_gl_early()
+            } else {
+                args = args.map { $0 == "virtio-gpu-gl-pci" ? "virtio-gpu-pci" : $0 }
+                HuskLog.log("emu", "downgraded to virtio-gpu-pci; software display")
+            }
+        }
+
         HuskLog.log("emu", "---- QEMU argv (\(args.count)) ----")
         for (i, a) in args.enumerated() {
             HuskLog.log("emu", String(format: "  [%2d] %@", i, a))
@@ -318,9 +364,22 @@ final class LegacyEmulationController {
         qemuReady = true
 
         // Must happen after qemu_init (the console does not exist before it) and
-        // before qemu_main_loop (which does not return). This is the same rule
-        // QemuRunner follows in its non-GL path; there is no GL path on 12.2.
-        husk_display_init()
+        // before qemu_main_loop (which does not return). Same rule QemuRunner
+        // follows; the two displays register competing listeners, so exactly one
+        // of them may run.
+        if glSurfaceUp {
+            // Before bind: registering the listener can deliver a scanout at
+            // once, and a frame presented through the Metal hook is a frame that
+            // would otherwise be blitted by the GL shader for nothing.
+            legacyInstallMetalPresenter()
+            glActive = husk_display_gl_bind()
+            HuskLog.log("emu", glActive
+                ? "GL display is up -- the phone's GPU is drawing the guest"
+                : "GL bind failed after a successful surface; using software")
+        }
+        if !glActive {
+            husk_display_init()
+        }
 
         // The socket exists as soon as qemu_init has run. Connect and start
         // mirroring the guest's console into the log file the UI tails.
@@ -338,6 +397,7 @@ final class LegacyEmulationController {
         qemu_cleanup()
         HuskLog.log("emu", "qemu_cleanup() done")
         qemuReady = false
+        glActive = false
         isRunning = false
     }
 
@@ -494,6 +554,9 @@ final class LegacyEmulationController {
     func grabFrame() -> (data: Data, width: Int, height: Int, stride: Int)? {
         // Nothing in QEMU may be touched before qemu_init() has returned.
         guard qemuReady else { return nil }
+        // With GL up there is no CPU framebuffer to copy: virgl keeps the pixels
+        // in a texture and the Metal presenter draws them straight to the layer.
+        guard !glActive else { return nil }
         // Same shape as HuskMetalView: zero-initialise, lock, copy, unlock.
         var info = HuskFrameInfo()
         guard husk_display_lock_frame(&info) else { return nil }

@@ -25,6 +25,9 @@ final class LegacyEmulationViewController: UIViewController {
     private let modeControl = UISegmentedControl(items: ["Console", "Screen"])
     private let terminalView = UITextView()
     private let screenView = UIImageView()
+    /// The GPU surface. virgl renders into its CAMetalLayer, so this is the view
+    /// that shows an accelerated guest; screenView stays as the software path.
+    private let glView = LegacyGLView.shared
     private let inputField = UITextField()
     private let enterButton = UIButton(type: .system)
     private let ctrlCButton = UIButton(type: .system)
@@ -119,6 +122,15 @@ final class LegacyEmulationViewController: UIViewController {
         screenView.addGestureRecognizer(
             UITapGestureRecognizer(target: self, action: #selector(screenTapped(_:))))
 
+        glView.backgroundColor = .black
+        glView.layer.cornerRadius = 8
+        glView.clipsToBounds = true
+        glView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        glView.isHidden = true
+        // The presenter needs the same layer the EGL surface is built on; it is
+        // one object for the life of the process.
+        LegacyMetalPresenter.shared.attach(layer: glView.metalLayer)
+
         // Input line. Every edit is refused and forwarded to the guest instead, so
         // the field stays empty and acts as a keystroke surface.
         inputField.backgroundColor = LegacyUI.surface
@@ -149,7 +161,7 @@ final class LegacyEmulationViewController: UIViewController {
         inputRow.distribution = .fill
 
         let vstack = UIStackView(arrangedSubviews: [statusLabel, guestLabel, buttonRow, modeControl,
-                                                    terminalView, screenView, inputRow])
+                                                    terminalView, glView, screenView, inputRow])
         vstack.axis = .vertical
         vstack.spacing = 10
         vstack.alignment = .fill
@@ -182,6 +194,15 @@ final class LegacyEmulationViewController: UIViewController {
     @objc private func startTapped() {
         startButton.isEnabled = false
         spinner.startAnimating()
+        // A GL guest needs its surface on screen before the EGL context is built
+        // against it: a hidden view has no window and no bounds, and creating a
+        // window surface on that is asking for a failure. This also means the
+        // picture appears where the user is already looking.
+        if LegacyEmulationController.shared.bootWantsGL {
+            modeControl.selectedSegmentIndex = 1
+            applyMode()
+            view.layoutIfNeeded()
+        }
         LegacyEmulationController.shared.start()
         stopButton.isEnabled = true
         refreshStatus()
@@ -213,16 +234,37 @@ final class LegacyEmulationViewController: UIViewController {
     }
 
     @objc private func modeChanged() {
+        applyMode()
+        if modeControl.selectedSegmentIndex == 0 { refreshTerminal() }
+    }
+
+    /// Console, or Screen -- and inside Screen either the GPU surface or the CPU
+    /// framebuffer. Which one is only known after Start, so this is re-applied
+    /// whenever the guest's display state changes.
+    private func applyMode() {
         let console = modeControl.selectedSegmentIndex == 0
+        let gl = LegacyEmulationController.shared.glActive
         terminalView.isHidden = !console
-        screenView.isHidden = console
-        if console {
+        glView.isHidden = console || !gl
+        screenView.isHidden = console || gl
+
+        if console || gl {
+            // Nothing to poll: with GL up the presenter draws on QEMU's thread,
+            // and in console mode the framebuffer is not on screen at all.
             screenTimer?.invalidate()
             screenTimer = nil
-            refreshTerminal()
         } else {
             startScreenTimer()
-            pumpFrame()
+        }
+        if !console { pumpFrame() }
+    }
+
+    /// GL comes up a second or two after Start, so the two screen surfaces have
+    /// to swap themselves without the user touching the tab again.
+    private func syncScreenVisibility() {
+        guard modeControl.selectedSegmentIndex == 1 else { return }
+        if glView.isHidden == LegacyEmulationController.shared.glActive {
+            applyMode()
         }
     }
 
@@ -272,10 +314,9 @@ final class LegacyEmulationViewController: UIViewController {
             self?.refreshTerminal()
             self?.refreshStatus()
             self?.refreshGuestCard()
+            self?.syncScreenVisibility()
         }
-        if modeControl.selectedSegmentIndex == 1 {
-            startScreenTimer()
-        }
+        applyMode()
     }
 
     private func startScreenTimer() {
@@ -385,4 +426,230 @@ extension LegacyEmulationViewController: UITextFieldDelegate {
         LegacyEmulationController.shared.typeText("\r")
         return false
     }
+}
+
+// MARK: - the GPU surface (the iOS 12 port of Husk's GL display)
+
+/// A CAMetalLayer-backed view. It is both what ANGLE creates its EGL window
+/// surface against and what the Metal presenter draws into.
+///
+/// Same role as HuskGLView on iOS 15, without the SwiftUI plumbing: layerClass,
+/// CAMetalLayer and Metal are all present on 12.2, which is what makes this path
+/// possible here at all. The engine itself is already inside the QEMU dylib --
+/// husk_display_gl_early/create/bind are exported, and ANGLE is built with a
+/// 12.2 deployment target.
+///
+/// One instance for the process: QEMU builds its EGL window surface against
+/// whichever layer is published when GL comes up and never rebuilds it, so a
+/// second view would orphan the display -- a frame counter climbing happily
+/// against a black screen.
+final class LegacyGLView: UIView {
+    static let shared = LegacyGLView(frame: .zero)
+
+    override class var layerClass: AnyClass { CAMetalLayer.self }
+    var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        isUserInteractionEnabled = false
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        // ANGLE presents through this layer, so it is rendered into rather than
+        // merely displayed.
+        metalLayer.framebufferOnly = false
+        metalLayer.isOpaque = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        _ = resizeDrawable()
+    }
+
+    /// The EGL surface is sized from the layer at create time, so it has to be
+    /// real before then. A view hidden inside a stack has zero bounds, hence the
+    /// screen-sized fallback: Android draws at panel resolution regardless, and
+    /// the presenter letterboxes whatever arrives.
+    @discardableResult
+    func resizeDrawable() -> CGSize {
+        var size = bounds.size
+        if size.width < 1 || size.height < 1 { size = UIScreen.main.bounds.size }
+        let scale = UIScreen.main.scale
+        let px = CGSize(width: floor(size.width * scale), height: floor(size.height * scale))
+        if px.width >= 1, px.height >= 1, metalLayer.drawableSize != px {
+            metalLayer.drawableSize = px
+        }
+        return metalLayer.drawableSize
+    }
+
+    /// Main thread. The layer plus the pixel size to build the surface at.
+    static func prepareSurface() -> (UnsafeMutableRawPointer, CGSize)? {
+        let v = shared
+        let px = v.resizeDrawable()
+        guard px.width >= 1, px.height >= 1 else { return nil }
+        return (Unmanaged.passUnretained(v.metalLayer).toOpaque(), px)
+    }
+}
+
+/// Draws each guest scanout from its own MTLTexture.
+///
+/// Not from the GL texture id virgl reports: that id belongs to virglrenderer's
+/// context, so attaching it to a framebuffer of ours raises
+/// GL_INVALID_FRAMEBUFFER_OPERATION on every blit and the picture stays black
+/// while the guest is demonstrably drawing. The pixels are in the MTLTexture this
+/// QEMU fork carries beside the id -- which is also what UTM's display reaches
+/// for first.
+final class LegacyMetalPresenter {
+    static let shared = LegacyMetalPresenter()
+
+    private var layer: CAMetalLayer?
+    private var device: MTLDevice?
+    private var queue: MTLCommandQueue?
+    private var pipeline: MTLRenderPipelineState?
+    private var sampler: MTLSamplerState?
+    private let lock = NSLock()
+    private var presented: UInt64 = 0
+
+    func attach(layer: CAMetalLayer) {
+        lock.lock()
+        self.layer = layer
+        lock.unlock()
+    }
+
+    /// Build against the texture's own device: a texture can only be sampled by
+    /// the device that owns it, and ANGLE picked that device, not us.
+    private func prepare(for texture: MTLTexture, _ layer: CAMetalLayer) -> Bool {
+        if pipeline != nil, device === texture.device { return true }
+
+        let dev = texture.device
+        device = dev
+        layer.device = dev
+        queue = dev.makeCommandQueue()
+
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        struct VOut { float4 pos [[position]]; float2 uv; };
+        struct Params { float flip; float rotate; float2 scale; };
+
+        vertex VOut husk_vertex(uint vid [[vertex_id]],
+                                constant Params &p [[buffer(0)]]) {
+            const float2 corners[4] = { float2(-1, -1), float2(1, -1),
+                                        float2(-1,  1), float2(1,  1) };
+            VOut o;
+            o.pos = float4(corners[vid] * p.scale, 0, 1);
+            float2 uv = corners[vid] * 0.5 + 0.5;
+            // Metal samples from the top-left, clip space counts y upward; the
+            // guest's own y_0_top then flips it back.
+            uv = float2(uv.x, p.flip > 0.5 ? uv.y : 1.0 - uv.y);
+            o.uv = p.rotate > 0.5 ? float2(1.0 - uv.y, uv.x) : uv;
+            return o;
+        }
+
+        fragment float4 husk_fragment(VOut in [[stage_in]],
+                                      texture2d<float> tex [[texture(0)]],
+                                      sampler smp [[sampler(0)]]) {
+            // Alpha forced opaque: Android's scanout is commonly B8G8R8X8, whose
+            // fourth byte is ignored by definition and zero in practice, and
+            // Core Animation would blend the frame away.
+            return float4(tex.sample(smp, in.uv).rgb, 1.0);
+        }
+        """
+
+        do {
+            let library = try dev.makeLibrary(source: source, options: nil)
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = library.makeFunction(name: "husk_vertex")
+            desc.fragmentFunction = library.makeFunction(name: "husk_fragment")
+            desc.colorAttachments[0].pixelFormat = layer.pixelFormat
+            pipeline = try dev.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            HuskLog.log("emu", "metal: could not build the present pipeline: \(error)")
+            pipeline = nil
+            return false
+        }
+
+        let sd = MTLSamplerDescriptor()
+        sd.minFilter = .linear
+        sd.magFilter = .linear
+        sd.sAddressMode = .clampToEdge
+        sd.tAddressMode = .clampToEdge
+        sampler = dev.makeSamplerState(descriptor: sd)
+
+        HuskLog.log("emu", "metal: presenting on \(dev.name), guest "
+                        + "\(texture.width)x\(texture.height) -> layer "
+                        + "\(Int(layer.drawableSize.width))x\(Int(layer.drawableSize.height))")
+        return sampler != nil
+    }
+
+    /// Called from QEMU's thread, once per guest frame.
+    func present(texture: MTLTexture, flip: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let layer = layer, prepare(for: texture, layer),
+              let queue = queue, let pipeline = pipeline, let sampler = sampler
+        else { return }
+
+        // nil when the pool is exhausted: a dropped frame, not an error.
+        guard let drawable = layer.nextDrawable() else { return }
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].storeAction = .store
+
+        guard let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeRenderCommandEncoder(descriptor: pass)
+        else { return }
+
+        // Letterbox rather than stretch: whichever axis runs out first sets the
+        // scale and the other is inset, so the guest keeps its aspect ratio.
+        let gw = Float(texture.width), gh = Float(texture.height)
+        let lw = Float(layer.drawableSize.width), lh = Float(layer.drawableSize.height)
+        var sx: Float = 1, sy: Float = 1
+        if gw > 0, gh > 0, lw > 0, lh > 0 {
+            let guestAspect = gw / gh
+            let layerAspect = lw / lh
+            if guestAspect > layerAspect { sy = layerAspect / guestAspect }
+            else                        { sx = guestAspect / layerAspect }
+        }
+
+        var params = (flip: Float(flip ? 1 : 0), rotate: Float(0), sx: sx, sy: sy)
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBytes(&params, length: MemoryLayout<Float>.size * 4, index: 0)
+        encoder.setFragmentTexture(texture, index: 0)
+        encoder.setFragmentSamplerState(sampler, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        encoder.endEncoding()
+
+        // No manual retain of the texture: a command buffer keeps every resource
+        // it references alive until it completes, which is exactly the window in
+        // which the GPU reads it.
+        buffer.present(drawable)
+        buffer.commit()
+
+        presented &+= 1
+        if presented == 1 || presented % 600 == 0 {
+            HuskLog.log("emu", "metal: presented \(presented) frames "
+                            + "(\(texture.width)x\(texture.height), flip=\(flip))")
+        }
+    }
+}
+
+/// The C entry point QEMU calls. A plain function pointer, so everything hangs
+/// off the shared presenter rather than a capture.
+private let legacyMetalPresent: husk_metal_present_fn = { texture, flip, _, _ in
+    guard let texture = texture else { return }
+    let obj = Unmanaged<AnyObject>.fromOpaque(texture).takeUnretainedValue()
+    guard let tex = obj as? MTLTexture else { return }
+    LegacyMetalPresenter.shared.present(texture: tex, flip: flip != 0)
+}
+
+func legacyInstallMetalPresenter() {
+    husk_display_gl_set_metal_presenter(legacyMetalPresent)
 }

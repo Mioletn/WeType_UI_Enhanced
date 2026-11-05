@@ -1,0 +1,19 @@
+name: ping
+
+# Diagnostic only: a trivial job on the cheapest runner, to tell a macOS-specific
+# problem (image capacity / macOS minutes) apart from an account-wide block on
+# starting any job at all. Delete once the build pipeline is healthy again.
+on:
+  push:
+    branches: [husk-ios12-build]
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: runner is alive
+        run: |
+          uname -a
+          echo "PING OK on $(date -u)"

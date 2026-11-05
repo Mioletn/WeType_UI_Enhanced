@@ -74,6 +74,28 @@ final class LegacyEmulationController {
         return "\(Bundle.main.bundlePath)/initramfs-virt"
     }
 
+    /// The guest's persistent root disk: a raw image in Documents, created sparse
+    /// so it costs nothing until ext4 actually writes to it. It starts empty, and
+    /// the initramfs only uses it as a root once the guest has formatted and
+    /// populated it -- until then the guest runs from tmpfs and leaves a seed
+    /// tarball at /.husk-seed.tar.gz for exactly that migration.
+    private func ensureRootDisk() -> String {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                       .userDomainMask, true)[0]
+        let path = (docs as NSString).appendingPathComponent("husk-root.img")
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+            if let h = FileHandle(forWritingAtPath: path) {
+                // truncate() with no argument is the iOS 12 form; the
+                // atOffset: variant arrived in iOS 13.
+                h.seek(toFileOffset: 2 * 1024 * 1024 * 1024)
+                h.truncate()
+                h.closeFile()
+            }
+        }
+        return path
+    }
+
     /// JIT region size, in bytes. Must match tb-size in the command line below
     /// so QEMU takes the whole prewarmed region instead of asking for a second
     /// one (which, with no debugger attached, can never be granted).
@@ -124,6 +146,7 @@ final class LegacyEmulationController {
     private func runQEMU() {
         isRunning = true
         let bundle = Bundle.main.bundlePath
+        let rootDisk = ensureRootDisk()
         let args: [String] = [
             "qemu-system-aarch64",
             "-M", "virt",
@@ -150,6 +173,12 @@ final class LegacyEmulationController {
             // aborted this path is bundled in pc-bios, which -L points at.
             "-nic", "user,model=virtio-net-pci",
             "-L", "\(bundle)/pc-bios",
+
+            // Persistent root disk. The guest formats it (e2fsprogs, from the
+            // network) and copies the seed tarball in; on the next boot the
+            // initramfs sees a usable ext4 and uses it instead of tmpfs.
+            "-drive", "if=none,id=vda,file=\(rootDisk),format=raw",
+            "-device", "virtio-blk-pci,drive=vda",
 
             // Graphics + input devices. The software display listens on console 0.
             // The keyboard device is for guests that read evdev themselves
@@ -185,6 +214,13 @@ final class LegacyEmulationController {
             HuskLog.log("emu", "needs \(((p as NSString).lastPathComponent)): "
                             + (ok ? "present" : "MISSING"))
         }
+
+        // Sparse, so this is the apparent size, not disk usage.
+        let diskAttrs = try? FileManager.default.attributesOfItem(atPath: rootDisk)
+        let diskSize = (diskAttrs?[.size] as? NSNumber)?.int64Value ?? 0
+        HuskLog.log("emu", "root disk: \(rootDisk) "
+                         + "(\(diskSize / (1024 * 1024)) MiB sparse; empty until the guest "
+                         + "formats it with mkfs.ext4)")
 
         HuskLog.log("emu", "---- QEMU argv (\(args.count)) ----")
         for (i, a) in args.enumerated() {

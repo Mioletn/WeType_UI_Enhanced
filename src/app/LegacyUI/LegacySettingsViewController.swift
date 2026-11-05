@@ -77,7 +77,7 @@ final class LegacySettingsViewController: UIViewController {
             + "GTA, GameMaker, Java apps, Flutter): run here too — they draw into a CAMetalLayer, "
             + "which iOS 8 has, through the ANGLE build the app carries.\n"
             + "• Web apps: need iOS 15, where the WKWebView bridge lives.\n"
-            + "• Full Android under QEMU: yes — the Emulation tab boots Phase 0 (Alpine aarch64, shipped in the IPA) through TCG and the software framebuffer. On iOS 12.2 this needs a jailbreak so the JIT pages can execute; no StikDebug required.\n"
+            + "• Emulation: a real Alpine Linux guest (3.24.3, aarch64) under QEMU/TCG — persistent ext4 root disk, working network, apk, and a console you can type into from the Emulation tab. Wants a jailbreak so the JIT pages may execute; no StikDebug. Boot kernel and root image live outside the IPA (they are far too large to ship per build), so the Emulation tab reports whether they are present.\n"
             + "• JIT: from a debugger (JIT tab), as on every other iOS.", 14)
         stack.addArrangedSubview(LegacyUI.sectionTitle("What works on iOS 12.2"))
         stack.addArrangedSubview(card([text]))

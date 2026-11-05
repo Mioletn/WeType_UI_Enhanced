@@ -15,8 +15,12 @@ import UIKit
 final class LegacyEmulationViewController: UIViewController {
 
     private let statusLabel = UILabel()
+    /// One line about the guest's three moving parts. Two of them live outside
+    /// the IPA, so "missing" has to be visible before Start is pressed.
+    private let guestLabel = UILabel()
     private let startButton = UIButton(type: .system)
     private let stopButton = UIButton(type: .system)
+    private let resetButton = UIButton(type: .system)
     private let spinner = UIActivityIndicatorView(style: .white)
     private let modeControl = UISegmentedControl(items: ["Console", "Screen"])
     private let terminalView = UITextView()
@@ -42,6 +46,7 @@ final class LegacyEmulationViewController: UIViewController {
         super.viewDidAppear(animated)
         startTimers()
         refreshStatus()
+        refreshGuestCard()
         refreshTerminal()
     }
 
@@ -58,6 +63,11 @@ final class LegacyEmulationViewController: UIViewController {
         statusLabel.text = "Idle"
         statusLabel.textAlignment = .center
 
+        guestLabel.font = huskMonospacedFont(ofSize: 11, weight: .regular)
+        guestLabel.textColor = LegacyUI.textDim
+        guestLabel.textAlignment = .center
+        guestLabel.numberOfLines = 0
+
         startButton.setTitle("Start guest (QEMU)", for: .normal)
         startButton.titleLabel?.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
         startButton.addTarget(self, action: #selector(startTapped), for: .touchUpInside)
@@ -68,7 +78,12 @@ final class LegacyEmulationViewController: UIViewController {
 
         spinner.hidesWhenStopped = true
 
-        let buttonRow = UIStackView(arrangedSubviews: [startButton, stopButton, spinner])
+        resetButton.setTitle("Reset disk", for: .normal)
+        resetButton.titleLabel?.font = UIFont.systemFont(ofSize: 15)
+        resetButton.addTarget(self, action: #selector(resetTapped), for: .touchUpInside)
+
+        let buttonRow = UIStackView(arrangedSubviews: [startButton, stopButton,
+                                                       resetButton, spinner])
         buttonRow.axis = .horizontal
         buttonRow.spacing = 16
         buttonRow.alignment = .center
@@ -133,7 +148,7 @@ final class LegacyEmulationViewController: UIViewController {
         inputRow.alignment = .fill
         inputRow.distribution = .fill
 
-        let vstack = UIStackView(arrangedSubviews: [statusLabel, buttonRow, modeControl,
+        let vstack = UIStackView(arrangedSubviews: [statusLabel, guestLabel, buttonRow, modeControl,
                                                     terminalView, screenView, inputRow])
         vstack.axis = .vertical
         vstack.spacing = 10
@@ -175,6 +190,26 @@ final class LegacyEmulationViewController: UIViewController {
     @objc private func stopTapped() {
         LegacyEmulationController.shared.stop()
         stopButton.isEnabled = false
+    }
+
+    /// Recovery path: a broken persistent root cannot be repaired from inside
+    /// the guest that is running off it, so throw the disk away instead.
+    @objc private func resetTapped() {
+        guard !LegacyEmulationController.shared.isRunning else {
+            LegacyUI.Banner("Stop the guest first", color: LegacyUI.warn).show(in: view)
+            return
+        }
+        let a = UIAlertController(
+            title: "Reset guest disk?",
+            message: "Deletes husk-root.img. The next start boots from the seed into a "
+                   + "throwaway tmpfs, and anything installed since is lost.",
+            preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        a.addAction(UIAlertAction(title: "Reset", style: .destructive) { [weak self] _ in
+            LegacyEmulationController.shared.resetRootDisk()
+            self?.refreshGuestCard()
+        })
+        present(a, animated: true)
     }
 
     @objc private func modeChanged() {
@@ -236,6 +271,7 @@ final class LegacyEmulationViewController: UIViewController {
         tickTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.refreshTerminal()
             self?.refreshStatus()
+            self?.refreshGuestCard()
         }
         if modeControl.selectedSegmentIndex == 1 {
             startScreenTimer()
@@ -290,6 +326,17 @@ final class LegacyEmulationViewController: UIViewController {
                                shouldInterpolate: false, intent: .defaultIntent)
         else { return nil }
         return UIImage(cgImage: cg)
+    }
+
+    private func refreshGuestCard() {
+        let s = LegacyEmulationController.shared.guestStatus()
+        let gib = String(format: "%.1f GiB", Double(s.diskBytes) / 1_073_741_824)
+        let kernel = s.kernelPresent ? "kernel OK" : "kernel MISSING"
+        let root = s.rootImagePresent ? "root image OK" : "root image MISSING (Phase 0)"
+        let disk = s.diskFormatted ? "disk \(gib) ext4" : "disk \(gib) unformatted"
+        guestLabel.text = "\(kernel)   ·   \(root)   ·   \(disk)"
+        guestLabel.textColor = (s.kernelPresent && s.rootImagePresent)
+            ? LegacyUI.textDim : LegacyUI.warn
     }
 
     private func refreshStatus() {

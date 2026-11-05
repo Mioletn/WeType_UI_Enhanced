@@ -269,6 +269,67 @@ final class LegacyEmulationController {
         isRunning = false
     }
 
+    // MARK: - guest status
+
+    /// What the Emulation screen can say about the guest before starting it.
+    ///
+    /// Three files make this feature work, and two of them are not in the IPA:
+    /// the kernel (patched in over the bundle's), the root initramfs (33 MB, in
+    /// Documents) and the root disk (created on demand). Without a way to see
+    /// that, a missing file looks exactly like a guest that fails to boot.
+    struct GuestStatus {
+        let kernelPresent: Bool
+        let rootImagePresent: Bool
+        let diskBytes: Int64
+        /// ext4 magic found, i.e. the guest has already formatted its disk and
+        /// will boot from it rather than from a throwaway tmpfs.
+        let diskFormatted: Bool
+    }
+
+    func guestStatus() -> GuestStatus {
+        let bundle = Bundle.main.bundlePath
+        let kernel = FileManager.default.fileExists(atPath: "\(bundle)/vmlinuz-virt")
+        let initrd = rootInitrdPath
+        let rootImage = (initrd != "\(bundle)/initramfs-virt")
+        let disk = ensureRootDisk()
+
+        var bytes: Int64 = 0
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: disk),
+           let n = attrs[.size] as? NSNumber {
+            bytes = n.int64Value
+        }
+        return GuestStatus(kernelPresent: kernel, rootImagePresent: rootImage,
+                           diskBytes: bytes, diskFormatted: hasExt4(disk))
+    }
+
+    /// ext4 puts its superblock at offset 1024 and the magic 0xEF53 at +56.
+    /// Reading two bytes is enough to tell "formatted" from "raw image", and it
+    /// needs nothing from the guest.
+    private func hasExt4(_ path: String) -> Bool {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        guard lseek(fd, 1080, SEEK_SET) == 1080 else { return false }
+        var b = [UInt8](repeating: 0, count: 2)
+        let n = b.withUnsafeMutableBufferPointer { read(fd, $0.baseAddress, 2) }
+        return n == 2 && b[0] == 0x53 && b[1] == 0xEF
+    }
+
+    /// Throw the root disk away so the next start rebuilds a tmpfs root from the
+    /// seed. This is the recovery path when the persistent root is broken -- the
+    /// guest cannot repair a disk it is running from.
+    @discardableResult
+    func resetRootDisk() -> Bool {
+        guard !isRunning else { return false }
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                       .userDomainMask, true)[0]
+        let path = (docs as NSString).appendingPathComponent("husk-root.img")
+        try? FileManager.default.removeItem(atPath: path)
+        _ = ensureRootDisk()
+        HuskLog.log("emu", "root disk reset -- next start boots from the seed (tmpfs)")
+        return true
+    }
+
     // MARK: - guest input
 
     /// Send one QKeyCode press/release by name. False if QEMU is not up yet or

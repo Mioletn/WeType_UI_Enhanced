@@ -18,6 +18,8 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/egl-helpers.h"
 #include "ui/egl-context.h"
@@ -27,6 +29,7 @@
 #include <dlfcn.h>
 
 #include "husk-display-gl.h"
+#include "husk-display.h"
 
 static DisplayGLCtx husk_gl_ctx;
 static QemuGLShader *husk_gls;
@@ -34,7 +37,6 @@ static EGLSurface    husk_surface = EGL_NO_SURFACE;
 static EGLContext    husk_context = EGL_NO_CONTEXT;
 
 static egl_fb husk_guest_fb;   /* what the guest drew */
-static egl_fb husk_window_fb;  /* the layer we present to */
 
 static int  husk_win_w, husk_win_h;
 static bool husk_have_scanout;
@@ -46,6 +48,49 @@ static uint64_t husk_gl_frames;
 static void *husk_metal_tex;
 static int   husk_metal_w, husk_metal_h;
 static husk_metal_present_fn husk_metal_present;
+
+/*
+ * The guest's picture, as plain bytes.
+ *
+ * This exists because eglSwapBuffers cannot be called from here. It runs on the
+ * QEMU main loop with the BQL held, and on this stack it blocks -- a CAMetalLayer
+ * that Core Animation is not currently presenting offers no drawable, so the
+ * swap waits for one. While it waits, the main loop is not polling, so the
+ * virtio-gpu control virtqueue is not drained either, and the guest fills it and
+ * wedges:
+ *
+ *   INFO: task kworker/3:1:57 blocked for more than 120 seconds.
+ *   Workqueue: events drm_fb_helper_damage_work
+ *    virtio_gpu_queue_fenced_ctrl_buffer
+ *    virtio_gpu_cmd_resource_flush
+ *
+ * That trace is the guest's kernel waiting for a flush command the host never
+ * completed. Every frame the guest drew made it worse, which is why the system
+ * went quiet about four minutes in and never reached SurfaceFlinger.
+ *
+ * So the frame is read back instead of being presented. glReadPixels runs
+ * against the scanout framebuffer, touches no drawable, and returns in single
+ * digit milliseconds at this size. The app then hands the bytes to a UIImageView
+ * through the same path the software display already uses -- which is a route
+ * that has been known to work on 12.2 all along.
+ *
+ * Two buffers, because the reader is on the UI thread: the QEMU thread fills
+ * the back one with the lock dropped, then swaps pointers under it.
+ */
+static uint8_t  *husk_cpu_buf[2];
+static size_t    husk_cpu_cap;
+static uint8_t  *husk_cpu_front;   /* published; what the UI copies from */
+static uint8_t  *husk_cpu_back;    /* being filled by the QEMU thread */
+static int       husk_cpu_w, husk_cpu_h;
+static uint64_t  husk_cpu_seq;
+static QemuMutex husk_cpu_lock;
+static bool      husk_cpu_lock_ready;
+static uint64_t  husk_cpu_frames, husk_cpu_skipped;
+
+/* Read-back rate. A guest flush arrives at well over a hundred hertz and each
+ * read-back is a synchronous GPU stall, so the cap is what keeps the main loop
+ * available to the virtqueues. Overridable from the app for one profiling run. */
+static int husk_cpu_fps = 15;
 
 void husk_display_gl_set_metal_presenter(husk_metal_present_fn fn)
 {
@@ -230,19 +275,163 @@ static void husk_gl_thumbnail(const char *what, GLuint fb, int w, int h)
  * black, the pixels are reaching the layer and the layer is not reaching the
  * screen -- three distinct bugs that until now all looked the same from here.
  */
+/*
+ * The picture the app will actually draw, straight out of the buffer it reads.
+ *
+ * This used to sample framebuffer 0, which was the EGL window surface. There is
+ * no window surface in the picture any more -- the frame goes back to the CPU
+ * instead -- so sampling it would only ever print black and prove nothing.
+ */
+static void husk_gl_cpu_thumbnail(void)
+{
+    static const char ramp[] = " .:-=+*#%@";
+    uint8_t *p;
+    int w, h;
+
+    qemu_mutex_lock(&husk_cpu_lock);
+    p = husk_cpu_front;
+    w = husk_cpu_w;
+    h = husk_cpu_h;
+    if (p == NULL || w <= 0 || h <= 0) {
+        qemu_mutex_unlock(&husk_cpu_lock);
+        fprintf(stderr, "[husk-gl] the cpu frame: nothing read back yet\n");
+        return;
+    }
+
+    fprintf(stderr, "[husk-gl] the cpu frame (%dx%d) at frame %llu:\n",
+            w, h, (unsigned long long)husk_cpu_seq);
+    for (int gy = 0; gy < HUSK_TH; gy++) {
+        char line[HUSK_TW + 1];
+        int y = (int)(((double)gy + 0.5) * h / HUSK_TH);
+        unsigned long long sum = 0;
+
+        for (int gx = 0; gx < HUSK_TW; gx++) {
+            int x = (int)(((double)gx + 0.5) * w / HUSK_TW);
+            const uint8_t *px = p + ((size_t)y * w + x) * 4;
+            int lum = (px[0] * 30 + px[1] * 59 + px[2] * 11) / 100;
+            sum += lum;
+            line[gx] = ramp[lum * 9 / 255];
+        }
+        line[HUSK_TW] = 0;
+        fprintf(stderr, "[husk-gl]   |%s| avg=%02llx\n", line, sum / HUSK_TW);
+    }
+    qemu_mutex_unlock(&husk_cpu_lock);
+}
+
 static void husk_gl_sample(void)
 {
     husk_gl_thumbnail("what the guest drew", husk_guest_fb.framebuffer,
                       husk_guest_fb.width, husk_guest_fb.height);
-    husk_gl_thumbnail("what we present", 0, husk_win_w, husk_win_h);
+    husk_gl_cpu_thumbnail();
+}
+
+/*
+ * Read the guest's scanout back into memory.
+ *
+ * Runs on the QEMU main loop with the BQL held and the context current, so it
+ * must not block on anything belonging to Core Animation -- which is the whole
+ * point: no drawable is touched here.
+ *
+ * The rows are flipped in place. GL's origin is bottom-left and a CGImage's is
+ * top-left, so without this the picture arrives upside down. It is a straight
+ * memcpy per row rather than 600 single-row glReadPixels calls, because each of
+ * those carries a full driver round trip.
+ */
+static bool husk_gl_readback(void)
+{
+    int w = husk_guest_fb.width;
+    int h = husk_guest_fb.height;
+    size_t need, stride;
+    uint8_t *dst, *tmp;
+    GLenum err;
+
+    if (w <= 0 || h <= 0 || husk_guest_fb.framebuffer == 0) {
+        return false;
+    }
+
+    stride = (size_t)w * 4;
+    need = stride * (size_t)h;
+
+    if (need > husk_cpu_cap) {
+        uint8_t *a = g_malloc0(need);
+        uint8_t *b = g_malloc0(need);
+
+        qemu_mutex_lock(&husk_cpu_lock);
+        g_free(husk_cpu_buf[0]);
+        g_free(husk_cpu_buf[1]);
+        husk_cpu_buf[0] = a;
+        husk_cpu_buf[1] = b;
+        husk_cpu_cap = need;
+        husk_cpu_front = NULL;
+        husk_cpu_back = a;
+        qemu_mutex_unlock(&husk_cpu_lock);
+
+        fprintf(stderr, "[husk-gl] readback buffers %zu bytes (%dx%d)\n",
+                need, w, h);
+    }
+
+    dst = husk_cpu_back;
+    if (dst == NULL) {
+        return false;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, husk_guest_fb.framebuffer);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+    err = glGetError();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (err != GL_NO_ERROR) {
+        static uint64_t complained;
+        if (complained++ % 120 == 0) {
+            fprintf(stderr, "[husk-gl] readback failed: 0x%x\n", err);
+        }
+        return false;
+    }
+
+    tmp = g_malloc(stride);
+    for (int y = 0; y < h / 2; y++) {
+        uint8_t *a = dst + (size_t)y * stride;
+        uint8_t *b = dst + (size_t)(h - 1 - y) * stride;
+        memcpy(tmp, a, stride);
+        memcpy(a, b, stride);
+        memcpy(b, tmp, stride);
+    }
+    g_free(tmp);
+
+    /*
+     * RGBA in, BGRA out.
+     *
+     * glReadPixels gives channel order R,G,B,A. Everything downstream was built
+     * for virtio-gpu's 2D scanout, which is BGRA in memory, and the app's CGImage
+     * is declared premultipliedFirst + byteOrder32Little -- BGRA. Swapping here
+     * keeps one pixel layout across both display modes instead of asking the app
+     * to know which one it is looking at.
+     */
+    for (size_t i = 0; i + 3 < need; i += 4) {
+        uint8_t t = dst[i];
+        dst[i] = dst[i + 2];
+        dst[i + 2] = t;
+    }
+
+    qemu_mutex_lock(&husk_cpu_lock);
+    husk_cpu_front = husk_cpu_back;
+    husk_cpu_back = (husk_cpu_back == husk_cpu_buf[0]) ? husk_cpu_buf[1]
+                                                       : husk_cpu_buf[0];
+    husk_cpu_w = w;
+    husk_cpu_h = h;
+    husk_cpu_seq++;
+    qemu_mutex_unlock(&husk_cpu_lock);
+
+    husk_cpu_frames++;
+    return true;
 }
 
 static void husk_gl_update(DisplayChangeListener *dcl,
                            uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    bool sample;
+    static int64_t last_ms;
+    int64_t now;
 
-    if (!husk_have_scanout || husk_surface == EGL_NO_SURFACE) {
+    if (!husk_have_scanout) {
         return;
     }
 
@@ -262,96 +451,47 @@ static void husk_gl_update(DisplayChangeListener *dcl,
         return;
     }
 
-    eglMakeCurrent(qemu_egl_display, husk_surface, husk_surface, husk_context);
-    egl_fb_setup_default(&husk_window_fb, husk_win_w, husk_win_h);
+    if (husk_surface == EGL_NO_SURFACE || husk_context == EGL_NO_CONTEXT) {
+        return;
+    }
 
     /*
-     * egl_fb_blit, not egl_texture_blit -- which is what QEMU itself uses.
+     * Rate limit, and the guest is why.
      *
-     * The two look interchangeable and are not. egl_texture_blit() samples the
-     * scanout as a GL_TEXTURE_2D through a shader, and sampling requires the
-     * texture to be COMPLETE. egl_fb_setup_for_tex() only attaches it to a
-     * framebuffer; it never sets GL_TEXTURE_MIN_FILTER, so the texture keeps
-     * the default GL_NEAREST_MIPMAP_LINEAR with no mipmap levels behind it. In
-     * GLES that is an incomplete texture, and sampling one is defined to return
-     * opaque black. Not an error, not a warning -- black.
-     *
-     * That is why the boot console appeared and Android did not. UEFI's
-     * scanouts are 2D resources virglrenderer creates and filters itself;
-     * Android's are 3D render targets from the guest's own Mesa driver, which
-     * sets sampler state per draw and leaves the texture object at its default.
-     * One was complete by accident, the other never could be.
-     *
-     * glBlitFramebuffer reads through the framebuffer attachment instead, where
-     * completeness does not apply -- only level 0 has to exist, which it does.
-     * gd_egl_scanout_flush() reaches for egl_texture_blit() only when it has a
-     * cursor to blend on top, and that path is desktop-GL anyway: the function
-     * opens with glEnable(GL_TEXTURE_2D), which GLES 3.0 does not have.
-     *
-     * The flip argument inverts with the function, exactly as it does upstream.
+     * A flush arrives per guest frame and the guest draws well over a hundred
+     * a second. Every one of those would otherwise cost a synchronous GPU
+     * read-back on the thread that also services the virtqueues. Fifteen is
+     * enough to watch Android boot and leaves the main loop responsive.
      */
-    egl_fb_blit(&husk_window_fb, &husk_guest_fb, !husk_flip);
-    {
-        static GLenum last_err = GL_NO_ERROR;
-        GLenum err = glGetError();
-        if (err != last_err) {
-            last_err = err;
-            fprintf(stderr, "[husk-gl] blit error state changed to 0x%x "
-                            "at frame %llu (guest %dx%d fb=%u -> window %dx%d)\n",
-                    err, (unsigned long long)husk_gl_frames,
-                    husk_guest_fb.width, husk_guest_fb.height,
-                    husk_guest_fb.framebuffer, husk_win_w, husk_win_h);
-        }
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (last_ms != 0 && now - last_ms < (1000 / husk_cpu_fps)) {
+        husk_cpu_skipped++;
+        return;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    last_ms = now;
+
+    if (eglMakeCurrent(qemu_egl_display, husk_surface, husk_surface,
+                       husk_context) != EGL_TRUE) {
+        static uint64_t complained;
+        if (complained++ % 120 == 0) {
+            fprintf(stderr, "[husk-gl] eglMakeCurrent failed on the QEMU thread: "
+                            "0x%x\n", eglGetError());
+        }
+        return;
+    }
+
+    if (!husk_gl_readback()) {
+        return;
+    }
 
     /* The first few frames, then rarely: this is a synchronous read-back and
      * it stalls the pipeline, so it must not be something the frame rate pays
      * for. Rare is enough -- it answers a yes/no question. */
-    /*
-     * Every 1200 frames never fired. Android restored from a snapshot draws
-     * about five hundred frames while the launcher comes up and then stops
-     * completely, so the only thumbnails in the log were the two from before
-     * anything had been drawn. Early and often, then rarely.
-     */
-    sample = husk_gl_frames == 1 || husk_gl_frames == 30
-          || husk_gl_frames == 120 || husk_gl_frames == 300
-          || (husk_gl_frames % 600) == 0;
-    if (sample) {
+    if (husk_cpu_frames == 1 || husk_cpu_frames == 10
+        || husk_cpu_frames == 60 || (husk_cpu_frames % 300) == 0) {
         husk_gl_sample();
     }
 
-    /*
-     * Force the alpha channel opaque, leaving colour untouched.
-     *
-     * egl_texture_blit() clears to (0.1, 0.1, 0.1, 0.0) and then draws the
-     * guest's texture with whatever alpha that texture carries. On a desktop
-     * that is harmless, because the window is opaque and the compositor never
-     * looks at alpha. Core Animation does: a CAMetalLayer is blended against
-     * what is behind it, so a frame whose alpha is zero is a frame nobody can
-     * see -- perfect pixels, correct size, invisible. Android's scanout is
-     * routinely B8G8R8X8, where the fourth byte is defined to be ignored and
-     * in practice is zero.
-     *
-     * The layer is also marked opaque on the UIKit side, which should make
-     * this redundant. Both, because the two live in different files and the
-     * symptom they prevent is a black screen with a healthy frame counter --
-     * the single hardest thing in this project to diagnose from a log.
-     */
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-
-    if (eglSwapBuffers(qemu_egl_display, husk_surface) != EGL_TRUE) {
-        static uint64_t complained;
-        if (complained++ % 600 == 0) {
-            fprintf(stderr, "[husk-gl] eglSwapBuffers failed: 0x%x "
-                            "(%llu frames drawn, none presented)\n",
-                    eglGetError(), (unsigned long long)husk_gl_frames);
-        }
-        return;
-    }
     husk_gl_frames++;
 }
 
@@ -382,6 +522,56 @@ static bool husk_gl_ctx_is_compatible_dcl(DisplayGLCtx *dgc,
 uint64_t husk_display_gl_frames(void)
 {
     return husk_gl_frames;
+}
+
+/*
+ * The GL-mode half of husk_display_lock_frame(). Same contract: on true the
+ * caller holds the lock and must unlock promptly.
+ *
+ * The lock is held across the caller's copy rather than handed out with a
+ * reference count, because the buffer the reader is copying from is also the
+ * one the QEMU thread is about to want back. A copy of a phone-sized frame is
+ * a millisecond; a reference count would be more machinery than the problem
+ * is worth.
+ */
+bool husk_display_gl_lock_frame(HuskFrameInfo *out)
+{
+    if (out == NULL || !husk_cpu_lock_ready) {
+        return false;
+    }
+    qemu_mutex_lock(&husk_cpu_lock);
+    if (husk_cpu_front == NULL || husk_cpu_w <= 0 || husk_cpu_h <= 0) {
+        qemu_mutex_unlock(&husk_cpu_lock);
+        return false;
+    }
+    out->pixels     = husk_cpu_front;
+    out->width      = husk_cpu_w;
+    out->height     = husk_cpu_h;
+    out->stride     = husk_cpu_w * 4;
+    out->bpp        = 32;
+    out->generation = 1;
+    out->sequence   = husk_cpu_seq;
+    return true;
+}
+
+void husk_display_gl_unlock_frame(void)
+{
+    if (husk_cpu_lock_ready) {
+        qemu_mutex_unlock(&husk_cpu_lock);
+    }
+}
+
+uint64_t husk_display_gl_cpu_sequence(void)
+{
+    return husk_cpu_seq;
+}
+
+/* How many guest flushes were dropped for rate limiting, and how many frames
+ * were actually read back -- the pair says whether the cap is doing anything. */
+void husk_display_gl_stats(uint64_t *frames, uint64_t *skipped)
+{
+    if (frames)  { *frames  = husk_cpu_frames; }
+    if (skipped) { *skipped = husk_cpu_skipped; }
 }
 
 /*
@@ -563,6 +753,15 @@ bool husk_display_gl_bind(void)
 {
     QemuConsole *con;
     const GLubyte *vendor;
+
+    /*
+     * Safe here and nowhere earlier: QEMU's mutexes do not exist before
+     * qemu_init(), and bind() runs after it.
+     */
+    if (!husk_cpu_lock_ready) {
+        qemu_mutex_init(&husk_cpu_lock);
+        husk_cpu_lock_ready = true;
+    }
 
     if (husk_surface == EGL_NO_SURFACE || husk_context == EGL_NO_CONTEXT) {
         fprintf(stderr, "[husk-gl] bind: nothing was created\n");

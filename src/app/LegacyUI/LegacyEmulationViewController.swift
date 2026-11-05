@@ -243,14 +243,23 @@ final class LegacyEmulationViewController: UIViewController {
     /// whenever the guest's display state changes.
     private func applyMode() {
         let console = modeControl.selectedSegmentIndex == 0
-        let gl = LegacyEmulationController.shared.glActive
         terminalView.isHidden = !console
-        glView.isHidden = console || !gl
-        screenView.isHidden = console || gl
+        /*
+         * One screen surface for both modes.
+         *
+         * The GL path used to own a CAMetalLayer and be presented by Core
+         * Animation. It no longer is: swapping an EGL window surface from the
+         * QEMU thread blocked on a drawable that was not being driven, the main
+         * loop stopped polling, and the guest's virtio-gpu control queue filled
+         * until its kernel wedged -- Android never got past init. The frame is
+         * read back to the CPU now, so it arrives here like any other picture
+         * and the layer only has to exist.
+         */
+        glView.isHidden = true
+        screenView.isHidden = console
 
-        if console || gl {
-            // Nothing to poll: with GL up the presenter draws on QEMU's thread,
-            // and in console mode the framebuffer is not on screen at all.
+        if console {
+            // Nothing to poll in console mode: the framebuffer is not on screen.
             screenTimer?.invalidate()
             screenTimer = nil
         } else {
@@ -263,7 +272,9 @@ final class LegacyEmulationViewController: UIViewController {
     /// to swap themselves without the user touching the tab again.
     private func syncScreenVisibility() {
         guard modeControl.selectedSegmentIndex == 1 else { return }
-        if glView.isHidden == LegacyEmulationController.shared.glActive {
+        // There is only one screen surface now, so the only thing that can still
+        // be out of date is whether a frame has arrived at all.
+        if screenView.isHidden || screenView.image == nil {
             applyMode()
         }
     }
@@ -507,7 +518,9 @@ final class LegacyGLView: UIView {
         }
         // Visible even when the tab is showing the console: a hidden layer is not
         // composited, and the surface has to survive until the user looks at it.
-        v.isHidden = false
+        // The layer is no longer presented from -- the frame goes back to the CPU
+        // and is drawn by an image view -- but the EGL surface is still built
+        // against it, so it has to exist with a real drawable size.
         let px = v.resizeDrawable()
         guard px.width >= 1, px.height >= 1 else { return nil }
         return (Unmanaged.passUnretained(v.metalLayer).toOpaque(), px)

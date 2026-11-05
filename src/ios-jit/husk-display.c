@@ -16,6 +16,7 @@
 #include "qapi/qapi-types-ui.h"
 
 #include "husk-display.h"
+#include "husk-display-gl.h"
 
 #include <os/log.h>
 #include <sys/time.h>
@@ -165,8 +166,17 @@ void husk_display_init(void)
 
 bool husk_display_lock_frame(HuskFrameInfo *out)
 {
-    if (!husk.inited || out == NULL) {
+    if (out == NULL) {
         return false;
+    }
+    /*
+     * In GL mode there is no DisplaySurface to borrow -- the guest's picture is
+     * a texture that never passes through this file. The GL path mirrors it into
+     * a CPU buffer for exactly this call, so fall through to it instead of
+     * reporting "no frame yet" for the whole run.
+     */
+    if (!husk.inited || husk.surface == NULL) {
+        return husk_display_gl_lock_frame(out);
     }
     qemu_mutex_lock(&husk.lock);
     if (husk.surface == NULL) {
@@ -190,14 +200,19 @@ bool husk_display_lock_frame(HuskFrameInfo *out)
 
 void husk_display_unlock_frame(void)
 {
-    if (husk.inited) {
+    if (husk.inited && husk.surface != NULL) {
         qemu_mutex_unlock(&husk.lock);
+    } else {
+        husk_display_gl_unlock_frame();
     }
 }
 
 uint64_t husk_display_sequence(void)
 {
-    return husk.inited ? qatomic_read(&husk.sequence) : 0;
+    if (husk.inited && husk.surface != NULL) {
+        return qatomic_read(&husk.sequence);
+    }
+    return husk_display_gl_cpu_sequence();
 }
 
 /*

@@ -555,13 +555,15 @@ final class LegacyEmulationController {
     ///
     /// Returns the raw framebuffer bytes (32bpp, what virtio-gpu gives and what
     /// Metal wants), plus width/height/stride, so the caller can build a CGImage.
+    ///
+    /// This works in both modes now. With GL up the picture is still a texture
+    /// inside virglrenderer, but husk-display-gl.c mirrors it into a CPU buffer
+    /// as it arrives -- presenting through EGL was what wedged the guest, so the
+    /// frame is read back and drawn here instead. husk_display_lock_frame()
+    /// dispatches to whichever buffer is live.
     func grabFrame() -> (data: Data, width: Int, height: Int, stride: Int)? {
         // Nothing in QEMU may be touched before qemu_init() has returned.
         guard qemuReady else { return nil }
-        // With GL up there is no CPU framebuffer to copy: virgl keeps the pixels
-        // in a texture and the Metal presenter draws them straight to the layer.
-        guard !glActive else { return nil }
-        // Same shape as HuskMetalView: zero-initialise, lock, copy, unlock.
         var info = HuskFrameInfo()
         guard husk_display_lock_frame(&info) else { return nil }
         defer { husk_display_unlock_frame() }

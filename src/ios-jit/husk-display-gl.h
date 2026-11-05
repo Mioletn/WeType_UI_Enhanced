@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "husk-display.h"
+
 /*
  * Bring up the GL display path against a CAMetalLayer. Must be called on the
  * QEMU thread after qemu_init(), and instead of husk_display_init() -- the two
@@ -27,6 +29,26 @@ bool husk_display_gl_bind(void);
 
 /* Frames presented, for the perf counter. */
 uint64_t husk_display_gl_frames(void);
+
+/*
+ * Borrow the guest's frame as plain RGBA bytes, top row first.
+ *
+ * The GL path does not present through an EGL window surface: swapping one from
+ * the QEMU thread blocks on a drawable Core Animation is not currently driving,
+ * which wedges the main loop and with it the virtio-gpu control queue. The frame
+ * is read back to memory instead, and this is how the app collects it.
+ *
+ * Same contract as husk_display_lock_frame(): on true the caller holds the lock
+ * and must call husk_display_gl_unlock_frame() after copying.
+ */
+bool husk_display_gl_lock_frame(HuskFrameInfo *out);
+void husk_display_gl_unlock_frame(void);
+
+/* Bumps once per read-back; cheaper than comparing pixels. */
+uint64_t husk_display_gl_cpu_sequence(void);
+
+/* frames read back / guest flushes dropped by the rate limit. */
+void husk_display_gl_stats(uint64_t *frames, uint64_t *skipped);
 
 /*
  * Present the guest's scanout directly from its Metal texture.

@@ -533,6 +533,21 @@ final class LegacyMetalPresenter {
     private let lock = NSLock()
     private var presented: UInt64 = 0
 
+    /// Whether the presenter actually draws.
+    ///
+    /// `<Documents>/husk-gl-draw` present = draw; absent = count scanouts only.
+    /// The second case is the isolation run: with the GL context created and
+    /// bound but no drawable touched, a surviving guest means the kill came from
+    /// our render pass; a guest that still dies means it came from virgl
+    /// executing the guest's own GL commands. Those need different fixes, and
+    /// guessing between them costs a 40-minute build each time.
+    private lazy var drawEnabled: Bool = {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                       .userDomainMask, true)[0]
+        let flag = (docs as NSString).appendingPathComponent("husk-gl-draw")
+        return FileManager.default.fileExists(atPath: flag)
+    }()
+
     func attach(layer: CAMetalLayer) {
         lock.lock()
         self.layer = layer
@@ -611,6 +626,18 @@ final class LegacyMetalPresenter {
         lock.lock()
         defer { lock.unlock() }
 
+        presented &+= 1
+        if presented == 1 {
+            HuskLog.log("emu", "metal: first scanout \(texture.width)x\(texture.height) "
+                            + "flip=\(flip) draw=\(drawEnabled)")
+        }
+        guard drawEnabled else {
+            if presented % 300 == 0 {
+                HuskLog.log("emu", "metal: \(presented) scanouts, draw disabled")
+            }
+            return
+        }
+
         guard let layer = layer, prepare(for: texture, layer),
               let queue = queue, let pipeline = pipeline, let sampler = sampler
         else { return }
@@ -654,8 +681,7 @@ final class LegacyMetalPresenter {
         buffer.present(drawable)
         buffer.commit()
 
-        presented &+= 1
-        if presented == 1 || presented % 600 == 0 {
+        if presented % 600 == 0 {
             HuskLog.log("emu", "metal: presented \(presented) frames "
                             + "(\(texture.width)x\(texture.height), flip=\(flip))")
         }

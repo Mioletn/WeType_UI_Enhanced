@@ -54,6 +54,57 @@ static HuskDisplayState husk;
 /* ------------------------------------------------------------ DCL callbacks */
 /* All of these run on the QEMU main-loop thread with the BQL held. */
 
+/*
+ * Print the guest's frame as a small picture.
+ *
+ * The counter says Android is flipping; it does not say what is on the screen,
+ * and "3000 frames" is equally consistent with a launcher and with a black
+ * rectangle. This answers the other half in one log line, without a screenshot
+ * tool that iOS 12.2 does not offer.
+ *
+ * The surface is x8r8g8b8, which is BGRA in memory: blue first.
+ */
+#define HUSK_DPY_TW 40
+#define HUSK_DPY_TH 18
+
+static void husk_dpy_thumbnail(uint64_t seq)
+{
+    static const char ramp[] = " .:-=+*#%@";
+    DisplaySurface *s = husk.surface;
+    const uint8_t *data;
+    int w, h, stride;
+
+    if (s == NULL) {
+        return;
+    }
+    w = surface_width(s);
+    h = surface_height(s);
+    stride = surface_stride(s);
+    data = surface_data(s);
+    if (w <= 0 || h <= 0 || data == NULL) {
+        return;
+    }
+
+    fprintf(stderr, "[husk-dpy] the guest's frame (%dx%d) at update #%llu:\n",
+            w, h, (unsigned long long)seq);
+    for (int gy = 0; gy < HUSK_DPY_TH; gy++) {
+        char line[HUSK_DPY_TW + 1];
+        int y = (int)(((double)gy + 0.5) * h / HUSK_DPY_TH);
+        unsigned long long sum = 0;
+
+        for (int gx = 0; gx < HUSK_DPY_TW; gx++) {
+            int x = (int)(((double)gx + 0.5) * w / HUSK_DPY_TW);
+            const uint8_t *px = data + (size_t)y * stride + (size_t)x * 4;
+            int lum = (px[2] * 30 + px[1] * 59 + px[0] * 11) / 100;
+            sum += lum;
+            line[gx] = ramp[lum * 9 / 255];
+        }
+        line[HUSK_DPY_TW] = 0;
+        fprintf(stderr, "[husk-dpy]   |%s| avg=%02llx\n", line, sum / HUSK_DPY_TW);
+    }
+    fflush(stderr);
+}
+
 static void husk_dpy_gfx_update(DisplayChangeListener *dcl,
                                 int x, int y, int w, int h)
 {
@@ -69,9 +120,12 @@ static void husk_dpy_gfx_update(DisplayChangeListener *dcl,
     /* The first few draws are the interesting ones -- they prove the guest is
      * alive and rendering. After that, log sparsely so a long session does not
      * drown the log. */
-    if (seq <= 5 || (seq % 600) == 0) {
+    if (seq <= 5 || (seq % 300) == 0) {
         HUSK_DLOG("gfx_update #%llu rect=%dx%d@%d,%d",
                   (unsigned long long)seq, w, h, x, y);
+    }
+    if (seq == 300 || seq == 900 || (seq % 1800) == 0) {
+        husk_dpy_thumbnail(seq);
     }
 }
 

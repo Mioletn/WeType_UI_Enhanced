@@ -37,6 +37,11 @@ final class LegacyEmulationViewController: UIViewController {
     private var screenTimer: Timer?
     private var lastSeq: UInt64 = 0
     private var lastRendered = ""
+    /// Set once the screen has been shown on its own. An autostarted guest begins
+    /// on the console tab -- nobody tapped Start, so nobody picked a tab -- and a
+    /// guest that is drawing a picture is what the user came to see. It fires at
+    /// most once, so switching back to Console by hand is respected.
+    private var autoShowedScreen = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -326,8 +331,27 @@ final class LegacyEmulationViewController: UIViewController {
             self?.refreshStatus()
             self?.refreshGuestCard()
             self?.syncScreenVisibility()
+            self?.autoShowScreenOnce()
         }
         applyMode()
+    }
+
+    /// Bring the picture up the first time the guest produces one.
+    ///
+    /// The console is the right tab while a guest is still booting -- that is
+    /// where the kernel tells you what it is doing. The moment there is a frame,
+    /// the picture is the more useful of the two, and on an autostart launch
+    /// there was no Start tap to make that choice.
+    private func autoShowScreenOnce() {
+        guard !autoShowedScreen,
+              modeControl.selectedSegmentIndex == 0,
+              LegacyEmulationController.shared.isRunning else { return }
+        guard LegacyEmulationController.shared.latestSequence() > 0 else { return }
+        autoShowedScreen = true
+        modeControl.selectedSegmentIndex = 1
+        applyMode()
+        LegacyUI.Banner("Guest is drawing — showing the screen", color: LegacyUI.accent)
+            .show(in: view)
     }
 
     private func startScreenTimer() {

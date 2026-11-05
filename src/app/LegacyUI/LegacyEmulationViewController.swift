@@ -532,6 +532,26 @@ final class LegacyMetalPresenter {
     private var sampler: MTLSamplerState?
     private let lock = NSLock()
     private var presented: UInt64 = 0
+    /// Drawing is what kills the process under TCG (a guest frame can be seconds
+    /// of GPU work), so frames are capped and only one may be in flight: the
+    /// point is to let the GPU drain instead of queueing another render pass on
+    /// top of work that has not finished.
+    private var lastDraw: CFTimeInterval = 0
+    private var inFlight = false
+    private var dropped = 0
+    private var slowestFrame: Double = 0
+
+    /// Frames per second cap. `<Documents>/husk-gl-fps` overrides it; default 20.
+    private lazy var fpsCap: Double = {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                       .userDomainMask, true)[0]
+        let path = (docs as NSString).appendingPathComponent("husk-gl-fps")
+        if let s = try? String(contentsOfFile: path, encoding: .utf8),
+           let v = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)), v > 0 {
+            return min(v, 120)
+        }
+        return 20
+    }()
 
     /// Whether the presenter actually draws.
     ///
@@ -638,12 +658,19 @@ final class LegacyMetalPresenter {
             return
         }
 
+        let now = CACurrentMediaTime()
+        guard !inFlight, now - lastDraw >= 1.0 / fpsCap else { return }
+        lastDraw = now
+
         guard let layer = layer, prepare(for: texture, layer),
               let queue = queue, let pipeline = pipeline, let sampler = sampler
         else { return }
 
         // nil when the pool is exhausted: a dropped frame, not an error.
-        guard let drawable = layer.nextDrawable() else { return }
+        guard let drawable = layer.nextDrawable() else {
+            dropped += 1
+            return
+        }
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
@@ -679,6 +706,21 @@ final class LegacyMetalPresenter {
         // it references alive until it completes, which is exactly the window in
         // which the GPU reads it.
         buffer.present(drawable)
+        inFlight = true
+        let frames = presented
+        buffer.addCompletedHandler { [weak self] cb in
+            guard let self = self else { return }
+            let seconds = cb.gpuEndTime - cb.gpuStartTime
+            self.lock.lock()
+            self.inFlight = false
+            if seconds > self.slowestFrame { self.slowestFrame = seconds }
+            self.lock.unlock()
+            if frames == 1 || frames % 120 == 0 {
+                HuskLog.log("emu", String(format:
+                    "metal: frame %llu GPU %.0f ms (slowest %.0f ms), %d dropped",
+                    frames, seconds * 1000, self.slowestFrame * 1000, self.dropped))
+            }
+        }
         buffer.commit()
 
         if presented % 600 == 0 {

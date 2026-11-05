@@ -284,13 +284,14 @@ final class LegacyEmulationController {
 
         HuskLog.log("emu", "autotype: \(text.count) chars queued from \(path)")
         let t = Thread { [weak self] in
-            // The guest reached its emergency shell at ~8.3 s on this device;
-            // wait well past that so the shell is certainly reading.
-            Thread.sleep(forTimeInterval: 16)
+            // The stock init reached its shell at ~8.3 s, but the real-root boot
+            // first unpacks a 4 MB tarball inside TCG, which is far slower. Wait
+            // long enough that the shell is certainly reading, then repeat: the
+            // proof command is idempotent, and a write into a booting guest is
+            // simply lost.
+            Thread.sleep(forTimeInterval: 40)
             self?.typeText(text)
-            // Write it a second time in case the first landed before the line
-            // discipline was live. The proof command is idempotent.
-            Thread.sleep(forTimeInterval: 6)
+            Thread.sleep(forTimeInterval: 15)
             self?.typeText(text)
             HuskLog.log("emu", "autotype: done")
         }

@@ -227,6 +227,16 @@ final class LegacyEmulationController {
         serial.write(text: text)
     }
 
+    /// Whether the serial console socket is up, i.e. whether typing can reach the
+    /// guest. The UI shows this, because "QEMU is running" and "you can type" are
+    /// different states and only one of them is interesting to a user.
+    var isConsoleConnected: Bool { serial.isConnected }
+
+    /// The console tail, for the terminal view to render.
+    func terminalText() -> String {
+        serial.terminalText()
+    }
+
     /// Type one character into the guest console.
     func typeCharacter(_ ch: Character) {
         typeText(String(ch))

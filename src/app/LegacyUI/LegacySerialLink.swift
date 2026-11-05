@@ -29,6 +29,16 @@ final class LegacySerialLink {
     private let writeLock = NSLock()
     private var readerThread: Thread?
 
+    /// The tail of the console, kept in memory for the terminal view.
+    ///
+    /// Reading the whole log file on a timer was fine for a 15 KB boot log but is
+    /// O(file) every tick, and the file never stops growing -- by the time a
+    /// session has a few hundred kilobytes of output, re-reading it ten times a
+    /// second is the most expensive thing the app does. A capped ring is O(1).
+    private var termBuffer = Data()
+    private let termLock = NSLock()
+    private let termCap = 64 * 1024
+
     init(socketPath: String, logPath: String) {
         self.socketPath = socketPath
         self.logPath = logPath
@@ -107,6 +117,17 @@ final class LegacySerialLink {
         write(bytes: Array(normalised.utf8))
     }
 
+    /// The console tail, for the terminal view to render.
+    ///
+    /// Decoded defensively: trimming the ring at a byte boundary can cut a UTF-8
+    /// sequence in half, and `String(decoding:as:)` replaces such fragments
+    /// instead of failing the whole buffer the way `String(data:encoding:)` would.
+    func terminalText() -> String {
+        termLock.lock()
+        defer { termLock.unlock() }
+        return String(decoding: termBuffer, as: UTF8.self)
+    }
+
     /// Append everything the guest prints to `logPath`, and keep doing it for the
     /// life of the connection.
     func startMirroringToLog() {
@@ -129,8 +150,16 @@ final class LegacySerialLink {
                     Darwin.read(self.fd, p.baseAddress, p.count)
                 }
                 if n > 0 {
-                    fh.write(Data(buf[0..<n]))
+                    let chunk = Data(buf[0..<n])
+                    fh.write(chunk)
                     fh.synchronizeFile()
+
+                    self.termLock.lock()
+                    self.termBuffer.append(chunk)
+                    if self.termBuffer.count > self.termCap {
+                        self.termBuffer = self.termBuffer.suffix(self.termCap)
+                    }
+                    self.termLock.unlock()
                 } else {
                     // 0 = guest closed, <0 = error. Either way, stop.
                     break

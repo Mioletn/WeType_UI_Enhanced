@@ -330,6 +330,13 @@ final class LegacyEmulationViewController: UIViewController {
 
     private func refreshGuestCard() {
         let s = LegacyEmulationController.shared.guestStatus()
+        if s.usingCustomArgs {
+            // The built-in fields describe the Alpine profile; under a custom
+            // command line they would be misleading, so name the profile instead.
+            guestLabel.text = "custom boot profile (husk-boot.args)"
+            guestLabel.textColor = LegacyUI.textDim
+            return
+        }
         let gib = String(format: "%.1f GiB", Double(s.diskBytes) / 1_073_741_824)
         let kernel = s.kernelPresent ? "kernel OK" : "kernel MISSING"
         let root = s.rootImagePresent ? "root image OK" : "root image MISSING (Phase 0)"

@@ -42,6 +42,20 @@ final class LegacyEmulationController {
     /// starts -- which is *before* qemu_init runs.
     private(set) var qemuReady = false
 
+    /// `<Documents>/husk-boot.args`: an optional QEMU command line, one token per
+    /// line, that replaces the built-in Alpine profile.
+    ///
+    /// This exists because fitting an OS to QEMU is iterative: the Android image
+    /// needs a different machine size, a different -append and four disks, and
+    /// every wrong guess would otherwise cost a 40-minute CI build. With this
+    /// file the command line is data on the device, so a wrong guess costs a
+    /// reboot. `$BUNDLE`, `$DOCS` and `$SOCK` expand to the install's paths.
+    var bootArgsPath: String = {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                       .userDomainMask, true)[0]
+        return (docs as NSString).appendingPathComponent("husk-boot.args")
+    }()
+
     /// Where the guest's serial console output is mirrored. The VC tails this
     /// file, so it is the in-app terminal view as well as the on-disk record.
     let serialLogPath: String = {
@@ -151,13 +165,63 @@ final class LegacyEmulationController {
         HuskLog.log("emu", "stop() requested -- guest keeps running until it halts")
     }
 
+    // MARK: - boot profile
+
+    /// `<Documents>/husk-boot.args` as a QEMU argv, or nil when there is no file
+    /// (in which case the built-in Alpine profile is used).
+    ///
+    /// One argv element per line, so a line may contain spaces -- `-append` needs
+    /// that, since its value is a single token holding many kernel parameters.
+    /// `-M virt` is therefore two lines. `#` starts a comment.
+    ///
+    /// A few options are appended when the file leaves them out, because no guest
+    /// boots on this platform without them and a silent omission would look like
+    /// a broken image:
+    ///   -accel   split-wx is mandatory; with it off TCG asks for an RWX mmap and
+    ///            iOS kills the process before -kernel is even opened.
+    ///   -L       pc-bios holds the option ROMs virtio-net needs.
+    ///   -serial  the Unix-socket chardev the terminal UI reads from and types
+    ///            into. Without it the guest console is invisible and untypable.
+    private func customBootArguments(bundle: String) -> [String]? {
+        guard let text = try? String(contentsOfFile: bootArgsPath, encoding: .utf8) else {
+            return nil
+        }
+        let docs = (bootArgsPath as NSString).deletingLastPathComponent
+        var out: [String] = ["qemu-system-aarch64"]
+        for raw in text.components(separatedBy: .newlines) {
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            line = line
+                .replacingOccurrences(of: "$BUNDLE", with: bundle)
+                .replacingOccurrences(of: "$DOCS", with: docs)
+                .replacingOccurrences(of: "$SOCK", with: serialSocketPath)
+            out.append(line)
+        }
+        guard out.count > 1 else { return nil }
+
+        if !out.contains("-accel") {
+            out += ["-accel", "tcg,tb-size=256,thread=multi,split-wx=on"]
+        }
+        if !out.contains("-L") {
+            out += ["-L", "\(bundle)/pc-bios"]
+        }
+        if !out.contains("-serial") {
+            out += ["-chardev", "socket,id=ser0,path=\(serialSocketPath),server=on,wait=off",
+                    "-serial", "chardev:ser0"]
+        }
+        if !out.contains("-display") { out += ["-display", "none"] }
+        if !out.contains("-monitor") { out += ["-monitor", "none"] }
+        return out
+    }
+
     // MARK: - QEMU thread
 
     private func runQEMU() {
         isRunning = true
         let bundle = Bundle.main.bundlePath
         let rootDisk = ensureRootDisk()
-        let args: [String] = [
+        let custom = customBootArguments(bundle: bundle)
+        let args: [String] = custom ?? [
             "qemu-system-aarch64",
             "-M", "virt",
             "-cpu", "cortex-a72",
@@ -213,24 +277,32 @@ final class LegacyEmulationController {
             "-d", "guest_errors,unimp",
         ]
 
-        // Confirm the guest images are where QEMU will look for them, and say
-        // which initramfs won -- bundle (Phase 0 shell) or Documents (real root).
-        let initrd = rootInitrdPath
-        let usingRoot = initrd != "\(bundle)/initramfs-virt"
-        HuskLog.log("emu", "initramfs: \(usingRoot ? "root filesystem image" : "bundled Phase 0") "
-                         + "-> \(initrd)")
-        for p in ["\(bundle)/vmlinuz-virt", initrd] {
-            let ok = FileManager.default.fileExists(atPath: p)
-            HuskLog.log("emu", "needs \(((p as NSString).lastPathComponent)): "
-                            + (ok ? "present" : "MISSING"))
-        }
+        if let custom = custom {
+            // The image names in the file are the file's business: report the
+            // profile and let the argv dump below be the record of what is used.
+            HuskLog.log("emu", "boot profile: CUSTOM -- \(custom.count) args from "
+                             + bootArgsPath)
+        } else {
+            // Confirm the guest images are where QEMU will look for them, and say
+            // which initramfs won -- bundle (Phase 0 shell) or Documents (real root).
+            let initrd = rootInitrdPath
+            let usingRoot = initrd != "\(bundle)/initramfs-virt"
+            HuskLog.log("emu", "boot profile: built-in Alpine")
+            HuskLog.log("emu", "initramfs: \(usingRoot ? "root filesystem image" : "bundled Phase 0") "
+                             + "-> \(initrd)")
+            for p in ["\(bundle)/vmlinuz-virt", initrd] {
+                let ok = FileManager.default.fileExists(atPath: p)
+                HuskLog.log("emu", "needs \(((p as NSString).lastPathComponent)): "
+                                + (ok ? "present" : "MISSING"))
+            }
 
-        // Sparse, so this is the apparent size, not disk usage.
-        let diskAttrs = try? FileManager.default.attributesOfItem(atPath: rootDisk)
-        let diskSize = (diskAttrs?[.size] as? NSNumber)?.int64Value ?? 0
-        HuskLog.log("emu", "root disk: \(rootDisk) "
-                         + "(\(diskSize / (1024 * 1024)) MiB sparse; empty until the guest "
-                         + "formats it with mkfs.ext4)")
+            // Sparse, so this is the apparent size, not disk usage.
+            let diskAttrs = try? FileManager.default.attributesOfItem(atPath: rootDisk)
+            let diskSize = (diskAttrs?[.size] as? NSNumber)?.int64Value ?? 0
+            HuskLog.log("emu", "root disk: \(rootDisk) "
+                             + "(\(diskSize / (1024 * 1024)) MiB sparse; empty until the guest "
+                             + "formats it with mkfs.ext4)")
+        }
 
         HuskLog.log("emu", "---- QEMU argv (\(args.count)) ----")
         for (i, a) in args.enumerated() {
@@ -284,6 +356,9 @@ final class LegacyEmulationController {
         /// ext4 magic found, i.e. the guest has already formatted its disk and
         /// will boot from it rather than from a throwaway tmpfs.
         let diskFormatted: Bool
+        /// A husk-boot.args is in force, so the fields above describe files the
+        /// boot profile may not even use. The card says so instead of lying.
+        let usingCustomArgs: Bool
     }
 
     func guestStatus() -> GuestStatus {
@@ -299,7 +374,9 @@ final class LegacyEmulationController {
             bytes = n.int64Value
         }
         return GuestStatus(kernelPresent: kernel, rootImagePresent: rootImage,
-                           diskBytes: bytes, diskFormatted: hasExt4(disk))
+                           diskBytes: bytes, diskFormatted: hasExt4(disk),
+                           usingCustomArgs: FileManager.default
+                               .fileExists(atPath: bootArgsPath))
     }
 
     /// ext4 puts its superblock at offset 1024 and the magic 0xEF53 at +56.

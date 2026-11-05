@@ -43,9 +43,30 @@ final class LegacyEmulationController {
     private(set) var qemuReady = false
 
     /// The GL display is registered and virgl is rendering into the Metal layer.
-    /// When true there is no CPU framebuffer to pump: frames arrive through the
-    /// Metal presenter, so grabFrame() has nothing to offer.
+    /// When true the frame is mirrored back to the CPU by husk-display-gl.c
+    /// instead of arriving as a DisplaySurface; grabFrame() handles both.
     private(set) var glActive = false
+
+    /// This run began from a saved machine, so the guest was already booted.
+    private(set) var restoredFromSnapshot = false
+
+    /// Save the booted machine.
+    ///
+    /// Asynchronous on purpose: the vCPUs stop, the guest's entire RAM is written
+    /// to the qcow2, and the callback reports the result. The guest does nothing
+    /// at all until it finishes, so this is never put on a timer -- it is a button
+    /// the user presses once the guest has reached somewhere worth returning to.
+    func saveSnapshot() {
+        guard isRunning, qemuReady else {
+            HuskLog.log("snap", "nothing is running; there is no machine to save")
+            return
+        }
+        HuskLog.log("snap", "saving the machine -- the guest stalls until it finishes")
+        husk_snapshot_save { ok, what in
+            let label = what.map { String(cString: $0) } ?? "save"
+            HuskLog.log("snap", "\(label) \(ok ? "succeeded" : "FAILED")")
+        }
+    }
 
     /// `<Documents>/husk-boot.args`: an optional QEMU command line, one token per
     /// line, that replaces the built-in Alpine profile.
@@ -373,6 +394,28 @@ final class LegacyEmulationController {
         }
         HuskLog.log("emu", "qemu_init() returned -- registering the software display")
         qemuReady = true
+
+        /*
+         * A saved machine is the difference between a phone and a demo.
+         *
+         * Android 13 under TCG needs about fifteen minutes to reach a launcher
+         * on this hardware, and that cost is paid on every launch unless the
+         * booted machine is kept. That is what this is: the whole guest -- RAM,
+         * devices, vCPU state -- written to the qcow2 and restored before the
+         * main loop starts. A restore takes seconds.
+         *
+         * On the very first run there is nothing to restore and this returns
+         * false, which is the normal path, not a failure: the guest then boots
+         * cold exactly as before. husk-snapshot.c stops the vCPUs and runs
+         * load_snapshot() itself, and puts the machine back the way it was when
+         * there is no snapshot, so this is safe to call unconditionally.
+         */
+        if husk_snapshot_load_at_startup() {
+            restoredFromSnapshot = true
+            HuskLog.log("emu", "restored a saved machine -- Android is already booted")
+        } else {
+            HuskLog.log("emu", "no saved machine; booting the guest from cold")
+        }
 
         // Must happen after qemu_init (the console does not exist before it) and
         // before qemu_main_loop (which does not return). Same rule QemuRunner

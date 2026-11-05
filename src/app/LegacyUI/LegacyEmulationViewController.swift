@@ -21,6 +21,7 @@ final class LegacyEmulationViewController: UIViewController {
     private let startButton = UIButton(type: .system)
     private let stopButton = UIButton(type: .system)
     private let resetButton = UIButton(type: .system)
+    private let snapshotButton = UIButton(type: .system)
     private let spinner = UIActivityIndicatorView(style: .white)
     private let modeControl = UISegmentedControl(items: ["Console", "Screen"])
     private let terminalView = UITextView()
@@ -90,8 +91,15 @@ final class LegacyEmulationViewController: UIViewController {
         resetButton.titleLabel?.font = UIFont.systemFont(ofSize: 15)
         resetButton.addTarget(self, action: #selector(resetTapped), for: .touchUpInside)
 
+        // Android needs about fifteen minutes of emulated CPU to boot. Saving it
+        // once means never paying that again -- the next Start restores instead.
+        snapshotButton.setTitle("Save snapshot", for: .normal)
+        snapshotButton.titleLabel?.font = UIFont.systemFont(ofSize: 15)
+        snapshotButton.addTarget(self, action: #selector(snapshotTapped), for: .touchUpInside)
+        snapshotButton.isEnabled = false
+
         let buttonRow = UIStackView(arrangedSubviews: [startButton, stopButton,
-                                                       resetButton, spinner])
+                                                       resetButton, snapshotButton, spinner])
         buttonRow.axis = .horizontal
         buttonRow.spacing = 16
         buttonRow.alignment = .center
@@ -210,12 +218,33 @@ final class LegacyEmulationViewController: UIViewController {
         }
         LegacyEmulationController.shared.start()
         stopButton.isEnabled = true
+        snapshotButton.isEnabled = true
         refreshStatus()
     }
 
     @objc private func stopTapped() {
         LegacyEmulationController.shared.stop()
         stopButton.isEnabled = false
+        snapshotButton.isEnabled = false
+    }
+
+    /// Save the booted guest so the next Start restores instead of booting.
+    ///
+    /// Worth saying out loud in the UI: the guest freezes while this runs, and a
+    /// snapshot taken mid-boot restores into a machine that is still mid-boot --
+    /// so it is only useful once the guest has reached something worth returning
+    /// to.
+    @objc private func snapshotTapped() {
+        snapshotButton.isEnabled = false
+        LegacyUI.Banner("Saving — the guest pauses until it finishes",
+                        color: LegacyUI.accent).show(in: view)
+        LegacyEmulationController.shared.saveSnapshot()
+        // The callback lands on the QEMU thread and the panel is not the place to
+        // wait for it; give the save a moment and let the user try again.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, LegacyEmulationController.shared.isRunning else { return }
+            self.snapshotButton.isEnabled = true
+        }
     }
 
     /// Recovery path: a broken persistent root cannot be repaired from inside

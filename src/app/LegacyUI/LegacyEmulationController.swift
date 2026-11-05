@@ -137,7 +137,14 @@ final class LegacyEmulationController {
     /// JIT region size, in bytes. Must match tb-size in the command line below
     /// so QEMU takes the whole prewarmed region instead of asking for a second
     /// one (which, with no debugger attached, can never be granted).
-    private let jitBytes = 256 * 1024 * 1024
+    ///
+    /// 512 MiB, not 256: the translation cache is the one lever left once the
+    /// hypervisor is out of reach (Hypervisor.framework does not exist on iOS 12;
+    /// it arrives in 13). Boot executes a long cold line of Android code, and a
+    /// cache that fills up re-translates everything a second time. husk-ios-jit.c
+    /// falls back to 256 MiB if the kernel refuses this much, so the failure mode
+    /// is a smaller cache, not a guest that cannot start.
+    private let jitBytes = 512 * 1024 * 1024
 
     // MARK: - start / stop
 

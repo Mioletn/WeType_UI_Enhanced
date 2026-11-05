@@ -517,6 +517,24 @@ HUSK_EXPORT bool husk_ios_jit_prewarm(size_t bytes)
     }
     husk_prewarm_done = true;
     husk_prewarmed = husk_ios_jit_allocate_real(bytes);
+
+    /*
+     * Asking for more than the kernel will give is not an error worth failing
+     * the whole run over.
+     *
+     * This is called once, from the app, before QEMU exists -- there is no
+     * second chance later, and a guest with no code-gen memory cannot start at
+     * all. So a refusal of the larger request is retried at the size that has
+     * always worked here, and the guest gets a smaller translation cache instead
+     * of nothing.
+     */
+    if (husk_prewarmed.rw_addr == NULL && bytes > (256u << 20)) {
+        fprintf(stderr, "[husk-jit] %zu MiB refused; falling back to 256 MiB\n",
+                bytes >> 20);
+        bytes = 256u << 20;
+        husk_prewarmed = husk_ios_jit_allocate_real(bytes);
+    }
+
     fprintf(stderr, "[husk-jit] prewarm %s: %zu bytes\n",
             husk_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
     return husk_prewarmed.rw_addr != NULL;

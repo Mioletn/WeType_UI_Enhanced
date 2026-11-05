@@ -24,6 +24,9 @@
 // runs on this OS.
 import Foundation
 import UIKit
+// open/ftruncate/close for the sparse root disk. Foundation re-exports Darwin in
+// practice, but naming it keeps the POSIX calls unambiguous.
+import Darwin
 
 final class LegacyEmulationController {
 
@@ -84,13 +87,20 @@ final class LegacyEmulationController {
                                                        .userDomainMask, true)[0]
         let path = (docs as NSString).appendingPathComponent("husk-root.img")
         if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
-            if let h = FileHandle(forWritingAtPath: path) {
-                // truncate() with no argument is the iOS 12 form; the
-                // atOffset: variant arrived in iOS 13.
-                h.seek(toFileOffset: 2 * 1024 * 1024 * 1024)
-                h.truncate()
-                h.closeFile()
+            // POSIX rather than FileHandle: the no-argument truncate() is gone
+            // from the current SDK ("missing argument for parameter 'atOffset'")
+            // and its replacement truncate(atOffset:) is iOS 13+. ftruncate has
+            // been available all along, and seeking past the end is what makes
+            // APFS create a sparse file.
+            let size: off_t = 2 * 1024 * 1024 * 1024
+            let fd = open(path, O_CREAT | O_RDWR, 0o644)
+            if fd >= 0 {
+                if ftruncate(fd, size) != 0 {
+                    HuskLog.log("emu", "root disk: ftruncate failed (errno \(errno))")
+                }
+                close(fd)
+            } else {
+                HuskLog.log("emu", "root disk: open failed (errno \(errno))")
             }
         }
         return path

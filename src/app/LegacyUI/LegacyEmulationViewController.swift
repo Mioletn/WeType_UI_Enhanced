@@ -485,8 +485,29 @@ final class LegacyGLView: UIView {
     }
 
     /// Main thread. The layer plus the pixel size to build the surface at.
+    ///
+    /// An EGL window surface cannot be created against a layer that is not in a
+    /// window, and QEMU may be started without the Emulation tab ever having been
+    /// shown (a headless launch, or the autostart flag). So the view parks itself
+    /// in the key window, at the back and screen-sized, when it has no window of
+    /// its own. Being a UIView, moving it into the tab later keeps the same
+    /// layer -- and the same EGL surface.
     static func prepareSurface() -> (UnsafeMutableRawPointer, CGSize)? {
         let v = shared
+        if v.window == nil {
+            let windows = UIApplication.shared.windows
+            let key = windows.first(where: { $0.isKeyWindow }) ?? windows.first
+            if let win = key {
+                v.frame = win.bounds
+                v.isHidden = false
+                win.insertSubview(v, at: 0)
+                HuskLog.log("emu", "GL surface parked in the key window "
+                                 + "(the tab is not on screen)")
+            }
+        }
+        // Visible even when the tab is showing the console: a hidden layer is not
+        // composited, and the surface has to survive until the user looks at it.
+        v.isHidden = false
         let px = v.resizeDrawable()
         guard px.width >= 1, px.height >= 1 else { return nil }
         return (Unmanaged.passUnretained(v.metalLayer).toOpaque(), px)

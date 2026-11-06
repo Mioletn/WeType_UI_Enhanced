@@ -68,7 +68,7 @@ xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
     -I build/fex/src/build-ios/include \
     -I build/fex/src/External/fmt/include \
     -I build/fex/src/External/unordered_dense/include \
-    src/app/Husk/FEXBridge.mm /tmp/husk_jit_stub.o \
+    src/app/Husk/FEXBridge.mm src/app/Husk/libcxx_pmr_backfill.mm /tmp/husk_jit_stub.o \
     -L build/ios-arm64/lib -lFEXCore_all \
     -o /tmp/libfexbridge_check.dylib
 echo "    FEXBridge.mm compiles and links"

@@ -73,6 +73,14 @@ xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
     -o /tmp/libfexbridge_check.dylib
 echo "    FEXBridge.mm compiles and links"
 
+# M1 measurement, off by default. The marker file keeps a normal build free of
+# Wine's clone and configure; the report lands in build/logs/m1 and is uploaded
+# with the IPA.
+if [ -f "$HUSK_ROOT/m1_probe.on" ]; then
+    step "M1: Wine unix side vs iOS 12.2 (report only)"
+    ./scripts/m1_wine_probe.sh || true
+fi
+
 step "fetch sources"
 ./scripts/fetch_sources.sh
 

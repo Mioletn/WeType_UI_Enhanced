@@ -161,13 +161,10 @@ int64_t husk_fex_probe(void) {
     std::lock_guard<std::mutex> lock(g_lock);
     if (g_cached.load() != -999) return g_cached.load();
 
-    // 1. dual-mapped JIT region from Husk's allocator
-    HuskDualMapping m{};
-    if (HuskDualMapping *p = husk_ios_jit_get_mapping()) {
-        m = *p;
-    } else {
-        m = husk_ios_jit_allocate(64u << 20);
-    }
+    // 1. dual-mapped JIT region from Husk's allocator. husk_ios_jit_allocate
+    //    hands back the prewarmed region when it is big enough, otherwise it
+    //    allocates one; the probe runs before QEMU, so this is the allocate path.
+    HuskDualMapping m = husk_ios_jit_allocate(64u << 20);
     if (!m.rw_addr || !m.rx_addr) {
         set_err("no JIT region (husk_ios_jit_allocate failed; route=%s)",
                 husk_ios_jit_self_route() ? husk_ios_jit_self_route() : "none");

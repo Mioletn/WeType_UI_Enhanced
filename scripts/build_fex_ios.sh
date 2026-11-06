@@ -55,6 +55,7 @@ if [ ! -f "$BUILD/CMakeCache.txt" ]; then
     echo "==> configuring FEXCore for iOS arm64, deployment target 12.0"
     cmake -S "$SRC" -B "$BUILD" -G Ninja \
         -DCMAKE_SYSTEM_NAME=iOS \
+        -DCMAKE_SYSTEM_PROCESSOR=arm64 \
         -DCMAKE_OSX_ARCHITECTURES=arm64 \
         -DCMAKE_OSX_SYSROOT=iphoneos \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \

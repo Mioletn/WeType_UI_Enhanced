@@ -112,6 +112,13 @@ targets:
           - "$(SRCROOT)/../../build/fex/src/FEXCore/include"
           - "$(SRCROOT)/../../build/fex/src"
           - "$(SRCROOT)/../../build/fex/src/External/fmt/include"
+          # fextl/robin_map.h includes <ankerl/unordered_dense.h>, which lives
+          # in the unordered_dense submodule. The rest are here so a later
+          # public header cannot fail the same way; absent paths are ignored.
+          - "$(SRCROOT)/../../build/fex/src/External/unordered_dense/include"
+          - "$(SRCROOT)/../../build/fex/src/External/range-v3/include"
+          - "$(SRCROOT)/../../build/fex/src/External/xxhash"
+          - "$(SRCROOT)/../../build/fex/src/External/zydis/include"
           # ConfigValues.inl / ConfigOptions.inl are generated into
           # <build>/include/FEXCore/Config by FEX's config_generator.py, and
           # Config.h includes them as <FEXCore/Config/...>.

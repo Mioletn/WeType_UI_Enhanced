@@ -85,6 +85,13 @@ targets:
         INFOPLIST_FILE: Husk/Info.plist
         CODE_SIGN_ENTITLEMENTS: "$(HUSK_ENTITLEMENTS)"
         SWIFT_OBJC_BRIDGING_HEADER: Husk/HuskBridge.h
+        # FEXCore's headers are C++20: fextl/memory.h uses std::is_base_of_v,
+        # std::is_array_v and std::destroy_at, which do not exist below C++17.
+        # Xcode's default for ObjC++ is older, so FEXBridge.mm failed to parse.
+        # gnu++20 matches what FEX's own CMake build uses (CMake_CXX_STANDARD 20
+        # with GNU extensions on). FEXBridge.mm is the only C++ TU in the app.
+        CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
+        CLANG_CXX_LIBRARY: "libc++"
         # libqemu-aarch64-softmmu.dylib has install_name @rpath/...
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"

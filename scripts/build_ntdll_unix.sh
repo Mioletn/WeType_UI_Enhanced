@@ -37,6 +37,17 @@ if [ ! -f "$SRC/configure" ]; then
 fi
 if [ ! -f "$BUILD/config.status" ]; then
     echo "==> configuring Wine for macOS (generated headers only)"
+    # macOS ships bison 2.3; Wine's configure insists on 3.0+. Homebrew's bison
+    # is keg-only, so it has to be put on PATH explicitly.
+    if ! bison --version 2>/dev/null | head -1 | grep -qE ' (3|4|5)\.'; then
+        echo "    installing bison"
+        brew install bison >/dev/null 2>&1 || true
+        for p in /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin; do
+            [ -x "$p/bison" ] && PATH="$p:$PATH"
+        done
+        export PATH
+    fi
+    echo "    bison: $(bison --version 2>/dev/null | head -1)"
     mkdir -p "$BUILD"
     ( cd "$BUILD" && ../configure \
         --without-x --disable-tests --enable-archs=aarch64 \
@@ -45,6 +56,14 @@ if [ ! -f "$BUILD/config.status" ]; then
         --without-odbc --without-opencl --without-opengl --without-osmesa \
         --without-krb5 --without-netapi --without-pcap --without-usb \
         --without-wayland ) > "$OUT/wine-configure.log" 2>&1
+    echo "    configure exit=$?"
+fi
+
+if [ ! -f "$BUILD/include/config.h" ]; then
+    echo "configure produced no include/config.h -- see logs/m1/wine-configure.log" \
+        | tee -a "$OUT/ntdll-summary.txt"
+    tail -5 "$OUT/wine-configure.log" 2>/dev/null
+    exit 0
 fi
 
 CFLAGS=(
@@ -80,18 +99,29 @@ compile() {
     fi
 }
 
-# The six TUs Madeira replaces on iOS, plus the two signal/thread ones.
-declare -A REPLACED=(
-    [loader]="loader_ios.c" [process]="process_ios.c" [server]="server_ios.c"
-    [env]="env_ios.c" [cdrom]="cdrom_stub.c" [virtual]="virtual_ios.c"
-    [signal_arm64]="signal_arm64_ios.c" [thread]="thread_ios.c"
-)
+# The eight TUs Madeira replaces on iOS. Written as a case, not an associative
+# array: /bin/bash on macOS is 3.2 and has no `declare -A`, which silently
+# killed this script after it had created an empty summary.
+replacement_for() {
+    case "$1" in
+        loader)       echo loader_ios.c ;;
+        process)      echo process_ios.c ;;
+        server)       echo server_ios.c ;;
+        env)          echo env_ios.c ;;
+        cdrom)        echo cdrom_stub.c ;;
+        virtual)      echo virtual_ios.c ;;
+        signal_arm64) echo signal_arm64_ios.c ;;
+        thread)       echo thread_ios.c ;;
+        *)            echo "" ;;
+    esac
+}
 
 echo "==> compiling ntdll unix for iOS $MIN"
 for src in "$SRC"/dlls/ntdll/unix/*.c; do
     name="$(basename "$src" .c)"
-    if [ -n "${REPLACED[$name]:-}" ]; then
-        compile "$SHIMS/${REPLACED[$name]}" "$name"
+    repl="$(replacement_for "$name")"
+    if [ -n "$repl" ] && [ -f "$SHIMS/$repl" ]; then
+        compile "$SHIMS/$repl" "$name"
     else
         compile "$src" "$name"
     fi

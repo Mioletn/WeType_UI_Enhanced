@@ -597,6 +597,7 @@ final class LegacyEmulationViewController: UIViewController {
             self?.autoShowScreenOnce()
             self?.checkSnapshotTrigger()
             self?.checkGuestCommand()
+            self?.checkFrameExport()
         }
         applyMode()
     }
@@ -632,6 +633,35 @@ final class LegacyEmulationViewController: UIViewController {
         guard !text.isEmpty else { return }
         HuskLog.log("cmd", "husk-guest-cmd: \(text)")
         LegacyEmulationController.shared.typeText(text + "\r")
+    }
+
+    /// Export the current guest frame as a real PNG so the picture can be
+    /// inspected off-device. SSH cannot press a button and cannot read the
+    /// framebuffer, but it can touch a file; the 10 Hz ticker sees it, copies
+    /// the CPU framebuffer once, and writes Documents/husk-frame.png.
+    private func checkFrameExport() {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                        .userDomainMask, true)[0]
+        let marker = (docs as NSString).appendingPathComponent("husk-export-frame")
+        guard FileManager.default.fileExists(atPath: marker) else { return }
+        try? FileManager.default.removeItem(atPath: marker)
+        guard let f = LegacyEmulationController.shared.grabFrame() else {
+            HuskLog.log("shot", "husk-export-frame: no frame available yet")
+            return
+        }
+        guard let img = makeImage(data: f.data, width: f.width,
+                                  height: f.height, stride: f.stride),
+              let png = UIImagePNGRepresentation(img) else {
+            HuskLog.log("shot", "husk-export-frame: PNG encode failed")
+            return
+        }
+        let out = (docs as NSString).appendingPathComponent("husk-frame.png")
+        do {
+            try png.write(to: URL(fileURLWithPath: out))
+            HuskLog.log("shot", "husk-frame.png \(f.width)x\(f.height) \(png.count) bytes")
+        } catch {
+            HuskLog.log("shot", "husk-export-frame write failed: \(error)")
+        }
     }
 
     /// Bring the picture up the first time the guest produces one.

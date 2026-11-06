@@ -87,6 +87,11 @@ if [ ! -f build/ios-arm64/lib/libhuskps4.dylib ]; then
         -o build/ios-arm64/lib/libhuskps4.dylib /tmp/husk_ps4_stub.c
 fi
 
+step "FEXCore (x86-64 -> ARM64 userspace JIT, iOS 12.2)"
+# Madeira-lite M0: proves FEXCore builds for and runs on iOS 12.2. Wine, DXMT
+# and Metal are deliberately absent -- see src/app/Husk/FEXBridge.mm.
+./scripts/build_fex_ios.sh
+
 step "app + IPA"
 df -h "$HUSK_ROOT" | tail -1
 mkdir -p "$(dirname "$OUT")"

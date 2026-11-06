@@ -97,11 +97,22 @@ targets:
           - "$(inherited)"
           - "$(SRCROOT)/../../build/ios-arm64/lib"
           - "$(SRCROOT)/Frameworks"
+        # FEXCore's public headers, for FEXBridge.mm (Madeira-lite M0). The
+        # tree is fetched and built by scripts/build_fex_ios.sh; the generated
+        # IRDefines.inc lives in the build directory, so both are on the path.
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../build/fex/src/FEXCore/include"
+          - "$(SRCROOT)/../../build/fex/src"
+          - "$(SRCROOT)/../../build/fex/src/External/fmt/include"
+          - "$(SRCROOT)/../../build/fex/src/build-ios"
         # zlib, for the translation layer's APK reader. Part of the iOS SDK. AudioToolbox is the sound a
         # cocos2d-x game's mixer plays through; CoreText and CoreGraphics draw its text labels.
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-lz"
+          # FEXCore, built by scripts/build_fex_ios.sh (Madeira-lite M0).
+          - "-lFEXCore_all"
           # libresolv: the phone's DNS servers, for games that resolve names themselves (Geode's c-ares).
           - "-lresolv"
           # SQLite for Java apps' android.database.sqlite (the system's own library).

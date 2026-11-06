@@ -28,6 +28,26 @@ final class LegacyRootViewController: UITabBarController {
         tabBar.tintColor = LegacyUI.accent
         tabBar.unselectedItemTintColor = LegacyUI.textDim
 
+        // FEXCore probe (Madeira-lite M0). Gated on a marker file so a normal
+        // boot never touches the JIT region -- the probe takes a dual-mapped
+        // region and leaves QEMU without a second one. With the marker present
+        // it runs a 12-byte x86-64 exit(42) through FEXCore and writes the
+        // result to Documents/husk-fex-probe.log for collection over SSH.
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0]
+        let probeMarker = (docs as NSString).appendingPathComponent("husk-fex-probe")
+        if FileManager.default.fileExists(atPath: probeMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let rc = husk_fex_probe()
+                var msg = "husk-fex-probe: exit=\(rc)"
+                if rc != 42, let e = husk_fex_last_error() {
+                    msg += " err=\(String(cString: e))"
+                }
+                HuskLog.log("fex", msg)
+                let logPath = (docs as NSString).appendingPathComponent("husk-fex-probe.log")
+                try? (msg + "\n").write(toFile: logPath, atomically: true, encoding: .utf8)
+            }
+        }
+
         // DEBUG auto-start: when this flag file is present, begin the QEMU guest
         // a few seconds after launch so the Emulation bring-up can be exercised
         // and its serial log captured with no UI interaction. Used for headless

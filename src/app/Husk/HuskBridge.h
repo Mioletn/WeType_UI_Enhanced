@@ -14,6 +14,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* FEXCore probe (Madeira-lite M0): husk_fex_probe() / husk_fex_last_error(). */
+#include "FEXBridge.h"
+
 /* Mirrors HuskFrameInfo in husk-display.h. */
 typedef struct HuskFrameInfo {
     const void *pixels;

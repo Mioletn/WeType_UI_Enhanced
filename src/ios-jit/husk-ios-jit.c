@@ -568,7 +568,7 @@ HUSK_EXPORT bool husk_ios_jit_reserve_bottom(size_t end)
     return ok;
 }
 
-HuskDualMapping husk_ios_jit_allocate(size_t bytes)
+HUSK_EXPORT HuskDualMapping husk_ios_jit_allocate(size_t bytes)
 {
     /*
      * Hand back the prewarmed region when it is big enough. QEMU asks for
@@ -915,7 +915,7 @@ static HuskDualMapping husk_ios_jit_allocate_real(size_t bytes)
     HuskDualMapping m = { NULL, NULL, 0 };
     return m;
 }
-HuskDualMapping husk_ios_jit_allocate(size_t bytes)
+HUSK_EXPORT HuskDualMapping husk_ios_jit_allocate(size_t bytes)
 {
     return husk_ios_jit_allocate_real(bytes);
 }

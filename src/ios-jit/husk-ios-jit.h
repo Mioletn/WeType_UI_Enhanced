@@ -74,7 +74,7 @@ HUSK_EXPORT void husk_ios_jit_install_trap_handler(void);
  * NULL on failure. `bytes` is rounded up to a 16 KiB page multiple by the caller's
  * contract -- StikDebug prepares whole pages.
  */
-HuskDualMapping husk_ios_jit_allocate(size_t bytes);
+HUSK_EXPORT HuskDualMapping husk_ios_jit_allocate(size_t bytes);
 
 /*
  * Claim the JIT region now, at app launch, and hold it until QEMU asks.

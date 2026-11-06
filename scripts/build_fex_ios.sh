@@ -32,14 +32,23 @@ OUT="$LIBDIR/libFEXCore_all.a"
 mkdir -p "$LIBDIR"
 
 if [ ! -f "$SRC/CMakeLists.txt" ]; then
-    echo "==> fetching FEX $FEX_SHA"
+    echo "==> fetching FEX $FEX_SHA (with the submodules FEXCore needs)"
+    # A codeload tarball is NOT enough: External/{fmt,vixl,xxhash,unordered_dense,
+    # zydis,range-v3,rpmalloc} are git submodules and come out empty, and the
+    # build then fails at configure with missing headers. Clone and initialise
+    # just the ones the library needs (the test binaries, Catch2, tracy,
+    # jemalloc, Vulkan-Headers and drm-headers are not built here).
     rm -rf "$SRC"
-    mkdir -p "$SRC"
-    TMP="$HUSK_ROOT/build/fex/fex.tar.gz"
-    curl -fL --retry 3 -o "$TMP" \
-        "https://codeload.github.com/willfaust/FEX/tar.gz/$FEX_SHA"
-    tar -xzf "$TMP" -C "$SRC" --strip-components=1
-    rm -f "$TMP"
+    git clone --filter=blob:none https://github.com/willfaust/FEX.git "$SRC"
+    git -C "$SRC" checkout "$FEX_SHA"
+    git -C "$SRC" submodule update --init --depth 1 \
+        External/fmt \
+        External/vixl \
+        External/xxhash \
+        External/unordered_dense \
+        External/zydis \
+        External/range-v3 \
+        External/rpmalloc
 fi
 
 if [ ! -f "$BUILD/CMakeCache.txt" ]; then

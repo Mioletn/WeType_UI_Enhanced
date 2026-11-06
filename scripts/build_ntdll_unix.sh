@@ -35,28 +35,47 @@ if [ ! -f "$SRC/configure" ]; then
     git clone --filter=blob:none https://github.com/willfaust/wine.git "$SRC" || exit 1
     git -C "$SRC" checkout "$WINE_SHA" || exit 1
 fi
-if [ ! -f "$BUILD/config.status" ]; then
+if [ ! -f "$BUILD/include/config.h" ]; then
     echo "==> configuring Wine for macOS (generated headers only)"
-    # macOS ships bison 2.3; Wine's configure insists on 3.0+. Homebrew's bison
-    # is keg-only, so it has to be put on PATH explicitly.
-    if ! bison --version 2>/dev/null | head -1 | grep -qE ' (3|4|5)\.'; then
-        echo "    installing bison"
-        brew install bison >/dev/null 2>&1 || true
-        for p in /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin; do
-            [ -x "$p/bison" ] && PATH="$p:$PATH"
-        done
-        export PATH
+
+    # bison 3+ (macOS ships 2.3) and a PE cross-compiler, because configure
+    # refuses to run without one when a PE arch is requested. We only need the
+    # unix side, but Wine's configure will not produce config.h otherwise, so a
+    # throwaway i386 PE toolchain is the cheapest way past it.
+    NEED=""
+    bison --version 2>/dev/null | head -1 | grep -qE ' (3|4|5)\.' || NEED="$NEED bison"
+    command -v i686-w64-mingw32-gcc >/dev/null 2>&1 || NEED="$NEED mingw-w64"
+    if [ -n "$NEED" ]; then
+        echo "    installing:$NEED"
+        brew install $NEED >/dev/null 2>&1 || true
     fi
+    for p in /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin; do
+        [ -x "$p/bison" ] && PATH="$p:$PATH"
+    done
+    export PATH
     echo "    bison: $(bison --version 2>/dev/null | head -1)"
-    mkdir -p "$BUILD"
-    ( cd "$BUILD" && ../configure \
-        --without-x --disable-tests --enable-archs=aarch64 \
-        --without-freetype --without-gnutls --without-vulkan --without-sdl \
-        --without-alsa --without-pulse --without-cups --without-dbus \
-        --without-odbc --without-opencl --without-opengl --without-osmesa \
-        --without-krb5 --without-netapi --without-pcap --without-usb \
-        --without-wayland ) > "$OUT/wine-configure.log" 2>&1
-    echo "    configure exit=$?"
+    echo "    pe cc: $(command -v i686-w64-mingw32-gcc || echo none)"
+
+    COMMON="--without-x --disable-tests --without-freetype --without-gnutls
+            --without-vulkan --without-sdl --without-alsa --without-pulse
+            --without-cups --without-dbus --without-odbc --without-opencl
+            --without-opengl --without-osmesa --without-krb5 --without-netapi
+            --without-pcap --without-usb --without-wayland"
+
+    # First arch spec that yields include/config.h wins. aarch64 needs
+    # llvm-mingw, which is not on the runner; i386 only needs brew's mingw-w64,
+    # and the PE side is never built here anyway.
+    for ARCHS in "--enable-archs=i386" "--enable-archs=x86_64" "--enable-archs=i386,x86_64" ""; do
+        echo "    trying ${ARCHS:-<no arch flag>}"
+        rm -rf "$BUILD"
+        mkdir -p "$BUILD"
+        ( cd "$BUILD" && ../configure $ARCHS $COMMON ) > "$OUT/wine-configure.log" 2>&1
+        if [ -f "$BUILD/include/config.h" ]; then
+            echo "    configure ok with ${ARCHS:-<no arch flag>}"
+            break
+        fi
+        grep -m2 -E "configure: error|error:" "$OUT/wine-configure.log" || tail -3 "$OUT/wine-configure.log"
+    done
 fi
 
 if [ ! -f "$BUILD/include/config.h" ]; then

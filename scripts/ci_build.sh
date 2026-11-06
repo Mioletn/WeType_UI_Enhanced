@@ -44,6 +44,24 @@ xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
     src/app/Husk/FEXBridge.mm
 echo "    FEXBridge.mm parses"
 
+step "FEXCore bridge: link check"
+# Actually link the bridge against libFEXCore_all.a with -undefined,error. The
+# app link otherwise only runs after the ~20-minute QEMU stage, and the first
+# failure there was a missing FEXCore::Allocator symbol; this reproduces that
+# resolution in seconds. A dylib is used because it needs no entry point.
+xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
+    -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+    -miphoneos-version-min=12.2 -dynamiclib -Wl,-undefined,error \
+    -I build/fex/src/FEXCore/include \
+    -I build/fex/src \
+    -I build/fex/src/build-ios/include \
+    -I build/fex/src/External/fmt/include \
+    -I build/fex/src/External/unordered_dense/include \
+    src/app/Husk/FEXBridge.mm \
+    -L build/ios-arm64/lib -lFEXCore_all \
+    -o /tmp/libfexbridge_check.dylib
+echo "    FEXBridge.mm compiles and links"
+
 step "fetch sources"
 ./scripts/fetch_sources.sh
 

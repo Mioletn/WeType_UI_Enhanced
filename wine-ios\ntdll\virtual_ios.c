@@ -23,7 +23,7 @@
 #endif
 
 #include "config.h"
-#include "../madeira_cfg.h"   /* ml1095: one config file */
+#include "madeira_cfg.h"   /* ml1095: one config file */
 #include <malloc/malloc.h>
 
 #include <assert.h>

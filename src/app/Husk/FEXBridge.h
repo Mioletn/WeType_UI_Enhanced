@@ -6,15 +6,16 @@
  * question this answers, before any Wine work, is whether it can be built for
  * and execute code on iOS 12.2 at all.
  *
- * husk_fex_probe() runs a six-byte x86-64 program:
+ * husk_fex_probe() runs a 53-byte self-checking x86-64 program through
+ * FEXCore on a dual-mapped JIT region taken from husk-ios-jit.c:
  *
- *     mov eax, 60      ; exit(2) syscall number
- *     mov edi, 42      ; status
- *     syscall
+ *     sum = 1+2+...+1000
+ *     if (sum != 500500) exit(1);
+ *     else exit(get42());          // call/ret through the call-ret stack
  *
- * through FEXCore on a dual-mapped JIT region taken from husk-ios-jit.c. It
- * returns 42 when translation, execution, the syscall hook and the exit path
- * all work; a negative value means setup failed (the reason is logged).
+ * It returns 42 when decoding, JIT codegen, the loop, the branch, the shadow
+ * call stack, the syscall hook and the exit path all work; a negative value
+ * means setup failed (the reason is logged).
  *
  * It is deliberately gated behind a marker file (Documents/husk-fex-probe) so
  * it never touches the JIT region on a normal boot: the naive path below sets

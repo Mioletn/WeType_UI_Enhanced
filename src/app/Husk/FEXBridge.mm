@@ -241,11 +241,19 @@ int64_t husk_fex_probe(void) {
 
     if (!g_ctx->InitCore()) { set_err("InitCore failed"); g_cached.store(-4); return -4; }
 
-    // 5. guest code: mov eax,60 ; mov edi,42 ; syscall
+    // 5. guest code: a 53-byte self-checking program, hand-assembled from
+    //    probe/probe.s in the workspace:
+    //        sum = 1+2+...+1000            (loop, cmp/jle)
+    //        if sum != 500500 -> exit(1)   (arithmetic + branch)
+    //        else call get42; exit(eax)    (call/ret through the call-ret stack)
+    //    Exit 42 therefore means the decoder, the JIT, the loop, the branch and
+    //    the shadow call stack all agree with a real assembler's output.
     static const uint8_t blob[] = {
-        0xB8, 0x3C, 0x00, 0x00, 0x00,   // mov eax, 60
-        0xBF, 0x2A, 0x00, 0x00, 0x00,   // mov edi, 42
-        0x0F, 0x05,                     // syscall
+        0x31, 0xC0, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x01, 0xC8, 0xFF, 0xC1,
+        0x81, 0xF9, 0xE8, 0x03, 0x00, 0x00, 0x7E, 0xF4, 0x3D, 0x14, 0xA3,
+        0x07, 0x00, 0x75, 0x09, 0xE8, 0x10, 0x00, 0x00, 0x00, 0x89, 0xC7,
+        0xEB, 0x05, 0xBF, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x3C, 0x00, 0x00,
+        0x00, 0x0F, 0x05, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3,
     };
     constexpr size_t CODE_SIZE = 0x4000;
     void *code = ::mmap(nullptr, CODE_SIZE, PROT_READ | PROT_WRITE,

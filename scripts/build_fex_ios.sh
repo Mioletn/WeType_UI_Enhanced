@@ -51,6 +51,40 @@ if [ ! -f "$SRC/CMakeLists.txt" ]; then
         External/rpmalloc
 fi
 
+# iOS 12 port: std::filesystem was introduced in iOS 13 and is marked
+# unavailable below it, so SourcecodeResolver.h cannot use
+# std::filesystem::path(...).stem(). Everything it does there is string work,
+# so replace it with an equivalent helper. Idempotent: re-running does nothing.
+echo "==> patching SourcecodeResolver.h for iOS 12 (no std::filesystem)"
+python3 - "$SRC/FEXCore/include/FEXCore/HLE/SourcecodeResolver.h" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+if "HuskStem" in s:
+    print("    already patched")
+    sys.exit(0)
+s = s.replace("#include <filesystem>\n", "")
+helper = """namespace FEXCore::HLE {
+// std::filesystem::path(Path).stem().string(), without <filesystem>.
+static inline fextl::string HuskStem(const fextl::string& Path) {
+  auto Slash = Path.rfind('/');
+  fextl::string Base = (Slash == fextl::string::npos) ? Path : Path.substr(Slash + 1);
+  if (Base == \".\" || Base == \"..\") {
+    return Base;
+  }
+  auto Dot = Base.rfind('.');
+  if (Dot != fextl::string::npos && Dot != 0) {
+    Base.resize(Dot);
+  }
+  return Base;
+}
+"""
+s = s.replace("namespace FEXCore::HLE {", helper, 1)
+s = s.replace("std::filesystem::path(GuestFilename).stem().string()", "HuskStem(GuestFilename)")
+open(p, "w", encoding="utf-8").write(s)
+print("    patched", p)
+PY
+
 if [ ! -f "$BUILD/CMakeCache.txt" ]; then
     echo "==> configuring FEXCore for iOS arm64, deployment target 12.0"
     # TUNE_CPU is not "native": that branch runs Scripts/aarch64_fit_native.py,

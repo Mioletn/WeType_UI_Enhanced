@@ -60,6 +60,12 @@ if [ ! -f "$BUILD/CMakeCache.txt" ]; then
         -DCMAKE_OSX_SYSROOT=iphoneos \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
         -DCMAKE_BUILD_TYPE=Release \
+        # Not "native": that branch runs Scripts/aarch64_fit_native.py, which
+        # reads /proc/cpuinfo (absent on macOS) and needs the Python
+        # `packaging`/`pkg_resources` modules (absent on the runner). A cross
+        # build has no meaningful native CPU anyway. cortex-a72 is ARMv8-A and
+        # supported by every clang, so the codegen is safe on A12.
+        -DTUNE_CPU=cortex-a72 \
         -DBUILD_TESTING=OFF \
         -DBUILD_THUNKS=OFF \
         -DBUILD_FEXCONFIG=OFF \

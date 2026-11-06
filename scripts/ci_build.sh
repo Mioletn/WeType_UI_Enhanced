@@ -49,6 +49,17 @@ step "FEXCore bridge: link check"
 # app link otherwise only runs after the ~20-minute QEMU stage, and the first
 # failure there was a missing FEXCore::Allocator symbol; this reproduces that
 # resolution in seconds. A dylib is used because it needs no entry point.
+# husk_ios_jit_* live in the QEMU dylib, which is not built yet, so a stub
+# stands in for them here; everything else must resolve for real.
+cat > /tmp/husk_jit_stub.c <<'STUB'
+#include <stddef.h>
+typedef struct { unsigned char *rw_addr; unsigned char *rx_addr; size_t size; } HuskDualMapping;
+HuskDualMapping husk_ios_jit_allocate(size_t n) { (void)n; HuskDualMapping m = {0, 0, 0}; return m; }
+const char *husk_ios_jit_self_route(void) { return "stub"; }
+STUB
+xcrun --sdk iphoneos clang -arch arm64 \
+    -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+    -miphoneos-version-min=12.2 -c /tmp/husk_jit_stub.c -o /tmp/husk_jit_stub.o
 xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
     -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
     -miphoneos-version-min=12.2 -dynamiclib -Wl,-undefined,error \
@@ -57,7 +68,7 @@ xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
     -I build/fex/src/build-ios/include \
     -I build/fex/src/External/fmt/include \
     -I build/fex/src/External/unordered_dense/include \
-    src/app/Husk/FEXBridge.mm \
+    src/app/Husk/FEXBridge.mm /tmp/husk_jit_stub.o \
     -L build/ios-arm64/lib -lFEXCore_all \
     -o /tmp/libfexbridge_check.dylib
 echo "    FEXBridge.mm compiles and links"

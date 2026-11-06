@@ -85,6 +85,29 @@ open(p, "w", encoding="utf-8").write(s)
 print("    patched", p)
 PY
 
+# iOS 12 port 2: Xcode 16.4's libc++ enforces the allocator rule that rebinding
+# an allocator to its own value_type returns the original type. fextl::FEXAlloc
+# derives from std::allocator and never declared rebind, so libc++ resolved it
+# to std::allocator<char> and tripped a static_assert in allocator_traits.h.
+# Adding the alias is additive and also correct for older libc++.
+echo "==> patching fextl::FEXAlloc rebind for newer libc++"
+python3 - "$SRC/FEXCore/include/FEXCore/fextl/allocator.h" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+if "struct rebind" in s:
+    print("    already patched")
+    sys.exit(0)
+anchor = "  using value_type = T;"
+if anchor not in s:
+    print("    anchor missing, leaving file alone")
+    sys.exit(0)
+s = s.replace(anchor,
+              anchor + "\n  template<class U> struct rebind { using other = FEXAlloc<U>; };", 1)
+open(p, "w", encoding="utf-8").write(s)
+print("    patched", p)
+PY
+
 if [ ! -f "$BUILD/CMakeCache.txt" ]; then
     echo "==> configuring FEXCore for iOS arm64, deployment target 12.0"
     # TUNE_CPU is not "native": that branch runs Scripts/aarch64_fit_native.py,

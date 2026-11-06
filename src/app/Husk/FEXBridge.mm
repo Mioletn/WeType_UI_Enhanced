@@ -86,6 +86,13 @@ static std::atomic<int64_t> g_cached{-999};
 static jmp_buf g_exit_jmp;
 static int64_t g_exit_code = 0;
 
+// The guest code region the probe hands to FEX. The decoder asks the syscall
+// handler whether an address is executable before decoding it
+// (Frontend::CheckRangeExecutable -> QueryGuestExecutableRange), so this has to
+// be reported or every block decodes as NOEXEC_INST and the thread dies.
+static uint64_t g_code_base = 0;
+static uint64_t g_code_size = 0;
+
 // ---------------------------------------------------------------------------
 // JIT region: exec allocations are carved out of the dual mapping
 // ---------------------------------------------------------------------------
@@ -127,10 +134,14 @@ public:
     }
 
     // SyscallHandler has two more pure virtuals. The probe has no code cache
-    // and no executable-file bookkeeping, so both are empty answers; without
-    // them HuskSyscall is abstract and the global instance will not compile.
+    // and no executable-file bookkeeping, so LookupExecutableFileSection is an
+    // empty answer; QueryGuestExecutableRange must answer for the probe's own
+    // code region or the x86 decoder refuses to decode it.
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(
-        FEXCore::Core::InternalThreadState *, uint64_t) override {
+        FEXCore::Core::InternalThreadState *, uint64_t Address) override {
+        if (g_code_base && Address >= g_code_base && Address < g_code_base + g_code_size) {
+            return {g_code_base, g_code_size, false};
+        }
         return {};
     }
     std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(
@@ -242,6 +253,8 @@ int64_t husk_fex_probe(void) {
     if (code == MAP_FAILED) { set_err("code mmap failed"); g_cached.store(-5); return -5; }
     memcpy(code, blob, sizeof(blob));
     uint64_t code_addr = reinterpret_cast<uint64_t>(code);
+    g_code_base = code_addr;
+    g_code_size = CODE_SIZE;
 
     // 6. guest stack, laid out like a Linux static binary's initial stack
     constexpr size_t STACK_SIZE = 0x10000;

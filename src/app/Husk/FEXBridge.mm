@@ -125,6 +125,18 @@ public:
         g_exit_code = -2;
         longjmp(g_exit_jmp, 1);
     }
+
+    // SyscallHandler has two more pure virtuals. The probe has no code cache
+    // and no executable-file bookkeeping, so both are empty answers; without
+    // them HuskSyscall is abstract and the global instance will not compile.
+    FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(
+        FEXCore::Core::InternalThreadState *, uint64_t) override {
+        return {};
+    }
+    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(
+        FEXCore::Core::InternalThreadState *, uint64_t) override {
+        return std::nullopt;
+    }
 };
 
 class HuskSignals final : public FEXCore::SignalDelegator {};

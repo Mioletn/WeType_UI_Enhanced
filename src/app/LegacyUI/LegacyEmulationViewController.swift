@@ -649,9 +649,11 @@ final class LegacyEmulationViewController: UIViewController {
             HuskLog.log("shot", "husk-export-frame: no frame available yet")
             return
         }
+        // img.pngData(), not UIImagePNGRepresentation(): Xcode 16.4's SDK marks
+        // the C function as replaced, which is a hard error under Swift 6.1.
         guard let img = makeImage(data: f.data, width: f.width,
                                   height: f.height, stride: f.stride),
-              let png = UIImagePNGRepresentation(img) else {
+              let png = img.pngData() else {
             HuskLog.log("shot", "husk-export-frame: PNG encode failed")
             return
         }

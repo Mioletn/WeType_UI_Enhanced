@@ -131,8 +131,13 @@ if [ ! -f "$BUILD/CMakeCache.txt" ]; then
         -DENABLE_ASSERTIONS=OFF
 fi
 
-echo "==> building FEXCore FEXCore_Base"
-cmake --build "$BUILD" --target FEXCore FEXCore_Base
+echo "==> building FEXCore FEXCore_Base JemallocLibs"
+# JemallocLibs, not JemallocDummy: the dummy is only created when NOT APPLE, and
+# AllocatorHooks.cpp (which defines FEXCore::Allocator::aligned_alloc and
+# aligned_free) is compiled into one of them and nothing else. Without it the
+# app link fails with "undefined symbols for architecture arm64:
+# FEXCore::Allocator::aligned_alloc/aligned_free".
+cmake --build "$BUILD" --target FEXCore FEXCore_Base JemallocLibs
 
 echo "==> merging archives into $OUT"
 rm -f "$OUT"

@@ -21,6 +21,13 @@ if [ -z "$PY3" ] || ! "$PY3" -c 'import yaml' >/dev/null 2>&1; then
     exit 1
 fi
 
+step "FEXCore (x86-64 -> ARM64 userspace JIT, iOS 12.2)"
+# Madeira-lite M0, deliberately first: it is independent of QEMU/ANGLE and it is
+# the one piece whose iOS 12.2 viability is unproven, so a failure here should
+# surface in minutes rather than after the hour-long QEMU build. Wine, DXMT and
+# Metal are absent on purpose -- see src/app/Husk/FEXBridge.mm.
+./scripts/build_fex_ios.sh
+
 step "fetch sources"
 ./scripts/fetch_sources.sh
 
@@ -86,11 +93,6 @@ if [ ! -f build/ios-arm64/lib/libhuskps4.dylib ]; then
         -install_name @rpath/libhuskps4.dylib \
         -o build/ios-arm64/lib/libhuskps4.dylib /tmp/husk_ps4_stub.c
 fi
-
-step "FEXCore (x86-64 -> ARM64 userspace JIT, iOS 12.2)"
-# Madeira-lite M0: proves FEXCore builds for and runs on iOS 12.2. Wine, DXMT
-# and Metal are deliberately absent -- see src/app/Husk/FEXBridge.mm.
-./scripts/build_fex_ios.sh
 
 step "app + IPA"
 df -h "$HUSK_ROOT" | tail -1

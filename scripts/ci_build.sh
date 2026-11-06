@@ -28,6 +28,22 @@ step "FEXCore (x86-64 -> ARM64 userspace JIT, iOS 12.2)"
 # Metal are absent on purpose -- see src/app/Husk/FEXBridge.mm.
 ./scripts/build_fex_ios.sh
 
+step "FEXCore bridge: syntax check"
+# Compile-only pass over the ObjC++ bridge. FEXBridge.mm is the only place the
+# app touches FEXCore's headers, and a header/API mismatch there would
+# otherwise surface only after the ~20-minute QEMU stage. -fsyntax-only needs
+# no link and no simulator, so this costs seconds.
+xcrun --sdk iphoneos clang++ -std=gnu++20 -arch arm64 \
+    -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+    -miphoneos-version-min=12.2 -fsyntax-only \
+    -I build/fex/src/FEXCore/include \
+    -I build/fex/src \
+    -I build/fex/src/build-ios/include \
+    -I build/fex/src/External/fmt/include \
+    -I build/fex/src/External/unordered_dense/include \
+    src/app/Husk/FEXBridge.mm
+echo "    FEXBridge.mm parses"
+
 step "fetch sources"
 ./scripts/fetch_sources.sh
 

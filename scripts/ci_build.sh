@@ -77,8 +77,8 @@ echo "    FEXBridge.mm compiles and links"
 # Wine's clone and configure; the report lands in build/logs/m1 and is uploaded
 # with the IPA.
 if [ -f "$HUSK_ROOT/m1_probe.on" ]; then
-    step "M1: Wine unix side vs iOS 12.2 (report only)"
-    ./scripts/m1_wine_probe.sh || true
+    step "M1: Wine ntdll unix for iOS 12.2"
+    ./scripts/build_ntdll_unix.sh || true
 fi
 
 step "fetch sources"

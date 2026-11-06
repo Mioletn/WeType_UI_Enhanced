@@ -112,7 +112,10 @@ targets:
           - "$(SRCROOT)/../../build/fex/src/FEXCore/include"
           - "$(SRCROOT)/../../build/fex/src"
           - "$(SRCROOT)/../../build/fex/src/External/fmt/include"
-          - "$(SRCROOT)/../../build/fex/src/build-ios"
+          # ConfigValues.inl / ConfigOptions.inl are generated into
+          # <build>/include/FEXCore/Config by FEX's config_generator.py, and
+          # Config.h includes them as <FEXCore/Config/...>.
+          - "$(SRCROOT)/../../build/fex/src/build-ios/include"
         # zlib, for the translation layer's APK reader. Part of the iOS SDK. AudioToolbox is the sound a
         # cocos2d-x game's mixer plays through; CoreText and CoreGraphics draw its text labels.
         OTHER_LDFLAGS:

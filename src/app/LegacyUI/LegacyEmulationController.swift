@@ -567,6 +567,23 @@ final class LegacyEmulationController {
         husk_display_send_pointer(Int32(max(0, guestX)), Int32(max(0, guestY)), false)
     }
 
+    /// One pointer transition for the full-screen view. The C side only emits
+    /// BTN_LEFT when the state changes, so holding `down: true` through Began
+    /// and Moved is a real swipe rather than a string of separate taps.
+    func sendPointer(guestX: Int, guestY: Int, down: Bool) {
+        guard qemuReady else { return }
+        husk_display_send_pointer(Int32(max(0, guestX)), Int32(max(0, guestY)), down)
+    }
+
+    /// Android maps KEY_ESC to KEYCODE_BACK on a virtio keyboard. The full
+    /// screen has no on-screen navigation bar of its own, so this is the way
+    /// out of an app without going back to the console.
+    func sendBackKey() {
+        guard qemuReady else { return }
+        _ = husk_display_send_key("esc", true)
+        _ = husk_display_send_key("esc", false)
+    }
+
     /// DEBUG hook: if a file named `emu_autotype` sits in the app bundle, type its
     /// contents into the guest once the guest has had time to reach its shell.
     ///

@@ -34,6 +34,23 @@ final class LegacyEmulationViewController: UIViewController {
     private let ctrlCButton = UIButton(type: .system)
     private let tabButton = UIButton(type: .system)
 
+    /// The Android view. Entering the tab with a guest that is already drawing
+    /// (or the moment a cold boot produces its first frame) hides every control
+    /// and gives the whole screen to the picture. The console stays one tap away.
+    private var mainStack: UIStackView?
+    private let fullScreenRoot = UIView()
+    private let fullScreenImage = UIImageView()
+    private let fullScreenBar = UIStackView()
+    private let consoleButton = UIButton(type: .system)
+    private let fillButton = UIButton(type: .system)
+    private let backButton = UIButton(type: .system)
+    private let saveButton = UIButton(type: .system)
+    private var fullScreen = false
+    /// Fit keeps the guest's aspect ratio; Fill stretches it to the iPad's.
+    private var fillMode = false
+    private var pointerDown = false
+    private var lastSentPoint = CGPoint(x: -1, y: -1)
+
     private var tickTimer: Timer?
     private var screenTimer: Timer?
     private var lastSeq: UInt64 = 0
@@ -43,6 +60,9 @@ final class LegacyEmulationViewController: UIViewController {
     /// guest that is drawing a picture is what the user came to see. It fires at
     /// most once, so switching back to Console by hand is respected.
     private var autoShowedScreen = false
+
+    override var prefersStatusBarHidden: Bool { fullScreen }
+    override var prefersHomeIndicatorAutoHidden: Bool { fullScreen }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -57,6 +77,14 @@ final class LegacyEmulationViewController: UIViewController {
         refreshStatus()
         refreshGuestCard()
         refreshTerminal()
+        // Returning to the tab with a guest that is already drawing: go straight
+        // to the picture. A first boot stays on the console until there is a
+        // frame to show, so the kernel log is visible instead of a black screen.
+        if LegacyEmulationController.shared.isRunning,
+           LegacyEmulationController.shared.latestSequence() > 0 {
+            modeControl.selectedSegmentIndex = 1
+            applyMode()
+        }
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -189,6 +217,190 @@ final class LegacyEmulationViewController: UIViewController {
             vstack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             inputRow.heightAnchor.constraint(equalToConstant: 40),
         ])
+        mainStack = vstack
+        setupFullScreen()
+        applyFullScreen()
+    }
+
+    // MARK: - the full-screen Android view
+
+    /// One picture and a translucent corner bar. Everything that makes this tab
+    /// look like a control panel hides behind it, so the guest fills the device
+    /// and a finger can reach any part of Android without dodging a button.
+    private func setupFullScreen() {
+        fullScreenRoot.backgroundColor = .black
+        fullScreenRoot.translatesAutoresizingMaskIntoConstraints = false
+        fullScreenRoot.isHidden = true
+        view.addSubview(fullScreenRoot)
+
+        fullScreenImage.contentMode = .scaleAspectFit
+        fullScreenImage.backgroundColor = .black
+        // Touches must fall through to the controller; a UIImageView that eats
+        // them would leave the guest with no input at all.
+        fullScreenImage.isUserInteractionEnabled = false
+        fullScreenImage.translatesAutoresizingMaskIntoConstraints = false
+        fullScreenRoot.addSubview(fullScreenImage)
+
+        NSLayoutConstraint.activate([
+            fullScreenRoot.topAnchor.constraint(equalTo: view.topAnchor),
+            fullScreenRoot.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            fullScreenRoot.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            fullScreenRoot.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            fullScreenImage.topAnchor.constraint(equalTo: fullScreenRoot.topAnchor),
+            fullScreenImage.bottomAnchor.constraint(equalTo: fullScreenRoot.bottomAnchor),
+            fullScreenImage.leadingAnchor.constraint(equalTo: fullScreenRoot.leadingAnchor),
+            fullScreenImage.trailingAnchor.constraint(equalTo: fullScreenRoot.trailingAnchor),
+        ])
+
+        styleFullKey(consoleButton, "Controls", #selector(exitFullScreen))
+        styleFullKey(fillButton, "Fill", #selector(toggleFill))
+        styleFullKey(backButton, "◀ Back", #selector(androidBack))
+        styleFullKey(saveButton, "Save", #selector(fullScreenSnapshot))
+        fullScreenBar.axis = .horizontal
+        fullScreenBar.spacing = 6
+        fullScreenBar.alignment = .center
+        fullScreenBar.distribution = .fill
+        fullScreenBar.backgroundColor = UIColor(white: 0, alpha: 0.45)
+        fullScreenBar.layer.cornerRadius = 8
+        fullScreenBar.alpha = 0.55
+        fullScreenBar.translatesAutoresizingMaskIntoConstraints = false
+        [consoleButton, fillButton, backButton, saveButton].forEach {
+            fullScreenBar.addArrangedSubview($0)
+        }
+        fullScreenRoot.addSubview(fullScreenBar)
+        NSLayoutConstraint.activate([
+            fullScreenBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
+                                               constant: 6),
+            fullScreenBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor,
+                                                    constant: -6),
+            fullScreenBar.heightAnchor.constraint(equalToConstant: 30),
+        ])
+    }
+
+    private func styleFullKey(_ b: UIButton, _ title: String, _ action: Selector) {
+        b.setTitle(title, for: .normal)
+        b.titleLabel?.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        b.setTitleColor(.white, for: .normal)
+        b.contentEdgeInsets = UIEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        b.addTarget(self, action: action, for: .touchUpInside)
+    }
+
+    private func applyFullScreen() {
+        mainStack?.isHidden = fullScreen
+        fullScreenRoot.isHidden = !fullScreen
+        // The Metal layer is docked by LegacyGLView on its own; the only surface
+        // that paints here is the CPU image.
+        glView.isHidden = true
+        fullScreenImage.contentMode = fillMode ? .scaleToFill : .scaleAspectFit
+        fillButton.setTitle(fillMode ? "Fit" : "Fill", for: .normal)
+        if let img = screenView.image { fullScreenImage.image = img }
+        setNeedsStatusBarAppearanceUpdate()
+        if #available(iOS 11.0, *) { setNeedsUpdateOfHomeIndicatorAutoHidden() }
+    }
+
+    @objc private func exitFullScreen() {
+        modeControl.selectedSegmentIndex = 0
+        applyMode()
+        refreshTerminal()
+    }
+
+    @objc private func toggleFill() {
+        fillMode = !fillMode
+        applyFullScreen()
+    }
+
+    @objc private func androidBack() {
+        LegacyEmulationController.shared.sendBackKey()
+    }
+
+    /// Save the booted machine without leaving the full-screen view. This is
+    /// the button that turns a fifteen-minute cold boot into a one-off: once it
+    /// has been pressed at the launcher, every later Start restores.
+    @objc private func fullScreenSnapshot() {
+        LegacyUI.Banner("Saving — the guest pauses until it finishes",
+                        color: LegacyUI.accent).show(in: view)
+        LegacyEmulationController.shared.saveSnapshot()
+    }
+
+    /// Undo whichever content mode is active. Fit has letterbox bars; Fill
+    /// stretches the picture over the whole view. Both are invertible, which is
+    /// what keeps a tap in the right place on Android.
+    private func guestPoint(_ p: CGPoint) -> (x: CGFloat, y: CGFloat)? {
+        guard let img = fullScreenImage.image else { return nil }
+        let b = fullScreenImage.bounds
+        let iw = img.size.width, ih = img.size.height
+        guard b.width > 0, b.height > 0, iw > 0, ih > 0 else { return nil }
+        let gx: CGFloat, gy: CGFloat
+        if fillMode {
+            gx = p.x / b.width * iw
+            gy = p.y / b.height * ih
+        } else {
+            let s = min(b.width / iw, b.height / ih)
+            let ox = (b.width - iw * s) / 2
+            let oy = (b.height - ih * s) / 2
+            gx = (p.x - ox) / s
+            gy = (p.y - oy) / s
+        }
+        guard gx >= 0, gy >= 0, gx < iw, gy < ih else { return nil }
+        return (gx, gy)
+    }
+
+    private func forwardTouch(_ t: UITouch, down: Bool, force: Bool) {
+        let p = t.location(in: fullScreenImage)
+        let gx: CGFloat, gy: CGFloat
+        if let g = guestPoint(p) {
+            gx = g.x; gy = g.y
+        } else if !down, lastSentPoint.x >= 0 {
+            // The finger left the picture before lifting. The release still has
+            // to reach the guest, or Android keeps thinking it is held down.
+            gx = lastSentPoint.x; gy = lastSentPoint.y
+        } else {
+            return
+        }
+        if !force {
+            let dx = gx - lastSentPoint.x, dy = gy - lastSentPoint.y
+            if dx * dx + dy * dy < 9 { return }   // ~3 guest pixels
+        }
+        lastSentPoint = CGPoint(x: gx, y: gy)
+        LegacyEmulationController.shared.sendPointer(guestX: Int(gx), guestY: Int(gy),
+                                                     down: down)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard fullScreen, let t = touches.first else {
+            super.touchesBegan(touches, with: event); return
+        }
+        // The corner bar (and the gap around its buttons) is ours, not the
+        // guest's. Rejecting the touch here rather than inside forwardTouch
+        // keeps Ended free to send the matching button-up in every case.
+        if fullScreenBar.frame.contains(t.location(in: fullScreenImage)) {
+            super.touchesBegan(touches, with: event); return
+        }
+        pointerDown = true
+        forwardTouch(t, down: true, force: true)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard fullScreen, pointerDown, let t = touches.first else {
+            super.touchesMoved(touches, with: event); return
+        }
+        forwardTouch(t, down: true, force: false)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard fullScreen, pointerDown, let t = touches.first else {
+            super.touchesEnded(touches, with: event); return
+        }
+        pointerDown = false
+        forwardTouch(t, down: false, force: true)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard fullScreen, pointerDown, let t = touches.first else {
+            super.touchesCancelled(touches, with: event); return
+        }
+        pointerDown = false
+        forwardTouch(t, down: false, force: true)
     }
 
     private func styleKey(_ b: UIButton, _ title: String, _ action: Selector) {
@@ -277,7 +489,11 @@ final class LegacyEmulationViewController: UIViewController {
     /// whenever the guest's display state changes.
     private func applyMode() {
         let console = modeControl.selectedSegmentIndex == 0
-        terminalView.isHidden = !console
+        // Screen == the whole device, not a widget in a stack. Console is the
+        // only mode that keeps the control panel on screen.
+        fullScreen = !console
+        applyFullScreen()
+        terminalView.isHidden = !console || fullScreen
         /*
          * One screen surface for both modes.
          *
@@ -290,7 +506,7 @@ final class LegacyEmulationViewController: UIViewController {
          * and the layer only has to exist.
          */
         glView.isHidden = true
-        screenView.isHidden = console
+        screenView.isHidden = console || fullScreen
 
         if console {
             // Nothing to poll in console mode: the framebuffer is not on screen.
@@ -306,11 +522,11 @@ final class LegacyEmulationViewController: UIViewController {
     /// to swap themselves without the user touching the tab again.
     private func syncScreenVisibility() {
         guard modeControl.selectedSegmentIndex == 1 else { return }
-        // There is only one screen surface now, so the only thing that can still
-        // be out of date is whether a frame has arrived at all.
-        if screenView.isHidden || screenView.image == nil {
-            applyMode()
-        }
+        // With one screen surface the only thing that can be out of date is
+        // whether a frame has arrived. Checking isHidden here would be true for
+        // every tick in full-screen mode and re-apply the mode ten times a
+        // second for nothing -- and each apply toggles the status bar.
+        if screenView.image == nil { applyMode() }
     }
 
     @objc private func focusInput() {
@@ -361,8 +577,23 @@ final class LegacyEmulationViewController: UIViewController {
             self?.refreshGuestCard()
             self?.syncScreenVisibility()
             self?.autoShowScreenOnce()
+            self?.checkSnapshotTrigger()
         }
         applyMode()
+    }
+
+    /// A file, not a tap. There is no way to press an on-screen button over
+    /// SSH, and a snapshot is only worth taking at the exact moment the guest
+    /// becomes usable -- which a boot-watching script can see in the serial log
+    /// before a human can. `touch Documents/husk-save-now` asks for one.
+    private func checkSnapshotTrigger() {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory,
+                                                        .userDomainMask, true)[0]
+        let marker = (docs as NSString).appendingPathComponent("husk-save-now")
+        guard FileManager.default.fileExists(atPath: marker) else { return }
+        try? FileManager.default.removeItem(atPath: marker)
+        HuskLog.log("snap", "husk-save-now marker seen -- saving from the console")
+        LegacyEmulationController.shared.saveSnapshot()
     }
 
     /// Bring the picture up the first time the guest produces one.
@@ -379,7 +610,7 @@ final class LegacyEmulationViewController: UIViewController {
         autoShowedScreen = true
         modeControl.selectedSegmentIndex = 1
         applyMode()
-        LegacyUI.Banner("Guest is drawing — showing the screen", color: LegacyUI.accent)
+        LegacyUI.Banner("Guest is drawing — Android is now full screen", color: LegacyUI.accent)
             .show(in: view)
     }
 
@@ -414,6 +645,7 @@ final class LegacyEmulationViewController: UIViewController {
         guard let img = makeImage(data: frame.data, width: frame.width,
                                   height: frame.height, stride: frame.stride) else { return }
         screenView.image = img
+        if fullScreen { fullScreenImage.image = img }
     }
 
     private func makeImage(data: Data, width: Int, height: Int, stride: Int) -> UIImage? {

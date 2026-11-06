@@ -409,7 +409,21 @@ void husk_display_send_pointer(int32_t x, int32_t y, bool button_down)
         if (y < 0) { y = 0; } else if (y >= h) { y = h - 1; }
         qemu_input_queue_abs(con, INPUT_AXIS_X, x, 0, w);
         qemu_input_queue_abs(con, INPUT_AXIS_Y, y, 0, h);
-        qemu_input_queue_btn(con, INPUT_BUTTON_LEFT, button_down);
+        /*
+         * Only button *transitions* go on the wire.
+         *
+         * A drag is a run of these calls with button_down held true. Emitting
+         * BTN_LEFT down on every move makes Android's InputReader see a fresh
+         * DOWN for each sample, so a swipe across the launcher turns into a
+         * string of taps on whatever happens to be under the finger. Keeping
+         * the state here means the UI thread can just pass down=true on Began
+         * and Moved, and false on Ended, without tracking anything itself.
+         */
+        static bool last_down = false;
+        if (button_down != last_down) {
+            qemu_input_queue_btn(con, INPUT_BUTTON_LEFT, button_down);
+            last_down = button_down;
+        }
         qemu_input_event_sync();
         if (ev <= 20 || (ev % 200) == 0) {
             HUSK_DLOG("pointer #%llu -> guest (%d,%d) down=%d [surface %dx%d]",

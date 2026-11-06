@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build FEXCore (x86/x86-64 -> ARM64 userspace JIT) as an iOS arm64 static
-# library, for the Madeira-lite path (docs/91-fex-lite.md).
+# library, for the Madeira-lite path (see src/app/Husk/FEXBridge.mm).
 #
 # This is M0 of that path and nothing more: the decisive question is whether
 # FEXCore compiles for, and executes code on, iOS 12.2. Nothing here involves

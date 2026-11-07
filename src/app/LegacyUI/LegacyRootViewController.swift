@@ -45,6 +45,20 @@ final class LegacyRootViewController: UITabBarController {
                 HuskLog.log("fex", msg)
                 let logPath = (docs as NSString).appendingPathComponent("husk-fex-probe.log")
                 try? (msg + "\n").write(toFile: logPath, atomically: true, encoding: .utf8)
+
+                // M5: the first Windows PE. Runs on this same queue right after
+                // the FEXCore self-check, so the JIT context is already warm and
+                // no two threads race to initialise it. hello.exe is a
+                // freestanding PE32+ whose entry returns 42 through a stubbed
+                // exit(60) syscall; see FEXBridge.mm.
+                let peRc = husk_pe_probe()
+                var peMsg = "husk-pe-probe: rc=\(peRc)"
+                if peRc != 42, let peErr = husk_pe_last_error() {
+                    peMsg += " err=\(String(cString: peErr))"
+                }
+                HuskLog.log("pe", peMsg)
+                let peLog = (docs as NSString).appendingPathComponent("husk-pe-probe.log")
+                try? (peMsg + "\n").write(toFile: peLog, atomically: true, encoding: .utf8)
             }
         }
 

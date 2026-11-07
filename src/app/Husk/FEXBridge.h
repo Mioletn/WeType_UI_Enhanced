@@ -36,6 +36,17 @@ int64_t husk_fex_probe(void);
 /* Human-readable reason for the last failure, or NULL. */
 const char *husk_fex_last_error(void);
 
+/* M5: map the bundled minimal PE32+ (Resources/hello.exe) into the FEX guest
+ * address space and execute its entry point through FEXCore. hello.exe is
+ * freestanding: its entry is `mov eax,42; ret`, with no imports referenced and
+ * no base relocations. Returns the guest exit() status (42 on success), or a
+ * negative setup error. Safe to call after husk_fex_probe(); if the FEX context
+ * has not been created yet it initialises one itself. */
+int64_t husk_pe_probe(void);
+
+/* Human-readable reason for the last PE failure, or NULL. */
+const char *husk_pe_last_error(void);
+
 #ifdef __cplusplus
 }
 #endif

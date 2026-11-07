@@ -56,6 +56,9 @@
 #undef HUSK_SAVED_DEBUG
 #endif
 
+// M5 needs NSBundle/NSData to reach the bundled PE image.
+#import <Foundation/Foundation.h>
+
 extern "C" void __clear_cache(void *start, void *end) {
     sys_icache_invalidate(start, static_cast<size_t>(
         static_cast<char *>(end) - static_cast<char *>(start)));
@@ -314,5 +317,236 @@ int64_t husk_fex_probe(void) {
 }
 
 const char *husk_fex_last_error(void) {
+    return g_err[0] ? g_err : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// M5: the first Windows PE
+//
+// Resources/hello.exe is a freestanding PE32+ produced by
+// x86_64-w64-mingw32-gcc. Its entry point is literally
+//
+//     b8 2a 00 00 00   mov eax, 42
+//     c3               ret
+//
+// No import is referenced on that path and there is no base relocation table,
+// so loading it needs no Windows loader at all: copy the PE headers to RVA 0,
+// copy each section to its VirtualAddress, then append a small x86-64 stub that
+// calls the entry point and converts the returned eax into Linux exit(60).
+//
+//     e8 <rel32>       call <AddressOfEntryPoint>
+//     89 c7            mov edi, eax
+//     b8 3c 00 00 00  mov eax, 60
+//     0f 05            syscall
+//
+// The stub is deliberately a `call`: the PE entry ends in `ret`, and FEXCore's
+// shadow call/return stack (already exercised by the M0 self-check) supplies
+// the return address. A 42 coming back through HuskSyscall proves that real PE
+// bytes were mapped, decoded and executed by the JIT.
+// ---------------------------------------------------------------------------
+static uint16_t pe_rd16(const uint8_t *p) {
+    uint16_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+static uint32_t pe_rd32(const uint8_t *p) {
+    uint32_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+
+struct HuskPEHeader {
+    uint32_t entry_rva;
+    uint32_t size_of_image;
+    uint32_t size_of_headers;
+    uint16_t section_count;
+    const uint8_t *sections;
+};
+
+static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
+    if (n < 0x40 || d[0] != 'M' || d[1] != 'Z') {
+        set_err("PE: no MZ signature"); return false;
+    }
+    const uint32_t pe = pe_rd32(d + 0x3c);
+    if (pe > n || n - pe < 24 || pe_rd32(d + pe) != 0x00004550u) {
+        set_err("PE: no PE signature at 0x%x", pe); return false;
+    }
+    const uint16_t machine = pe_rd16(d + pe + 4);
+    const uint16_t nsec = pe_rd16(d + pe + 6);
+    const uint16_t optsz = pe_rd16(d + pe + 20);
+    if (machine != 0x8664) {
+        set_err("PE: machine 0x%x is not x86-64", (unsigned)machine); return false;
+    }
+    // PE32+ data directories start at +112, so a header smaller than that
+    // cannot carry SizeOfImage at +56 / SizeOfHeaders at +60.
+    if (optsz < 112 || (uint64_t)pe + 24 + optsz + (uint64_t)nsec * 40 > n) {
+        set_err("PE: truncated optional/section headers (optsz=%u nsec=%u)",
+                (unsigned)optsz, (unsigned)nsec);
+        return false;
+    }
+    const uint8_t *opt = d + pe + 24;
+    if (pe_rd16(opt) != 0x20b) {
+        set_err("PE: not PE32+ (magic 0x%x)", (unsigned)pe_rd16(opt)); return false;
+    }
+    // Reject a relocation directory: this path deliberately has no relocation
+    // support, and silently ignoring one would produce a confusing crash.
+    const uint32_t nrva = pe_rd32(opt + 108);
+    if (nrva > 5 && (pe_rd32(opt + 112 + 5 * 8) || pe_rd32(opt + 112 + 5 * 8 + 4))) {
+        set_err("PE: base relocations are not supported by this probe"); return false;
+    }
+    out->entry_rva = pe_rd32(opt + 16);
+    out->size_of_image = pe_rd32(opt + 56);
+    out->size_of_headers = pe_rd32(opt + 60);
+    out->section_count = nsec;
+    out->sections = opt + optsz;
+    if (!out->size_of_image || out->size_of_image > (64u << 20)) {
+        set_err("PE: bad SizeOfImage 0x%x", out->size_of_image); return false;
+    }
+    if (out->size_of_headers > n || out->size_of_headers > out->size_of_image) {
+        set_err("PE: bad SizeOfHeaders 0x%x", out->size_of_headers); return false;
+    }
+    if (out->entry_rva >= out->size_of_image) {
+        set_err("PE: entry RVA 0x%x outside image", out->entry_rva); return false;
+    }
+    return true;
+}
+
+static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
+    // The Swift call site runs this right after husk_fex_probe(), but keep it
+    // self-contained so a standalone PE marker also works.
+    if (!g_ctx) {
+        const int64_t warm = husk_fex_probe();
+        if (warm != 42 || !g_ctx) {
+            set_err("PE: FEXCore not ready (warm=%lld)", (long long)warm);
+            return -20;
+        }
+    }
+
+    HuskPEHeader pe{};
+    if (!husk_parse_pe32plus(file, file_size, &pe)) return -21;
+
+    constexpr size_t PAGE = 0x1000;
+    const size_t stub_rva = (pe.size_of_image + PAGE - 1) & ~(PAGE - 1);
+    const size_t map_size = stub_rva + PAGE;
+    void *image = ::mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (image == MAP_FAILED) { set_err("PE: image mmap failed"); return -22; }
+    uint8_t *base = static_cast<uint8_t *>(image);
+
+    memcpy(base, file, pe.size_of_headers);
+    for (uint16_t i = 0; i < pe.section_count; i++) {
+        const uint8_t *s = pe.sections + (size_t)i * 40;
+        const uint32_t va = pe_rd32(s + 12);
+        const uint32_t rawsize = pe_rd32(s + 16);
+        const uint32_t raw = pe_rd32(s + 20);
+        if (!rawsize) continue;
+        if ((uint64_t)va + rawsize > map_size ||
+            (uint64_t)raw + rawsize > file_size) {
+            set_err("PE: section %u out of range (va=0x%x raw=0x%x size=0x%x)",
+                    (unsigned)i, va, raw, rawsize);
+            ::munmap(image, map_size);
+            return -23;
+        }
+        memcpy(base + va, file + raw, rawsize);
+    }
+
+    uint8_t stub[] = {
+        0xE8, 0x00, 0x00, 0x00, 0x00,             // call rel32
+        0x89, 0xC7,                               // mov edi, eax
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05                                // syscall
+    };
+    const int64_t rel = (int64_t)pe.entry_rva - (int64_t)(stub_rva + 5);
+    if (rel < -2147483648LL || rel > 2147483647LL) {
+        set_err("PE: entry too far from stub"); ::munmap(image, map_size); return -24;
+    }
+    const int32_t rel32 = static_cast<int32_t>(rel);
+    memcpy(stub + 1, &rel32, sizeof(rel32));
+    memcpy(base + stub_rva, stub, sizeof(stub));
+
+    const uint64_t image_addr = reinterpret_cast<uint64_t>(image);
+    g_code_base = image_addr;   // QueryGuestExecutableRange must cover the PE
+    g_code_size = map_size;
+
+    constexpr size_t STACK_SIZE = 0x10000;
+    void *stack = ::mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) {
+        set_err("PE: stack mmap failed");
+        ::munmap(image, map_size);
+        return -25;
+    }
+    uint64_t *sp = reinterpret_cast<uint64_t *>(
+        reinterpret_cast<uint64_t>(stack) + STACK_SIZE);
+    *(--sp) = 0; // AT_NULL value
+    *(--sp) = 0; // AT_NULL type
+    *(--sp) = 0; // envp[0]
+    *(--sp) = 0; // argv[0]
+    *(--sp) = 0; // argc
+    const uint64_t start_sp = reinterpret_cast<uint64_t>(sp);
+
+    auto *thread = g_ctx->CreateThread(image_addr + stub_rva, start_sp);
+    if (!thread) {
+        set_err("PE: CreateThread null");
+        ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
+        return -26;
+    }
+    {
+        constexpr size_t CR = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+        void *a = ::mmap(nullptr, CR + 2 * PAGE, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (a == MAP_FAILED) {
+            set_err("PE: callret mmap failed");
+            ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
+            return -27;
+        }
+        void *crbase = static_cast<uint8_t *>(a) + PAGE;
+        ::mprotect(crbase, CR, PROT_READ | PROT_WRITE);
+        thread->CallRetStackBase = crbase;
+        thread->CurrentFrame->State.callret_sp =
+            reinterpret_cast<uint64_t>(crbase) + CR / 4;
+    }
+    {
+        static FEXCore::Core::CPUState::gdt_segment gdt[1] = {};
+        gdt[0].L = 1; gdt[0].D = 0; gdt[0].P = 1; gdt[0].S = 1;
+        gdt[0].Type = 0b1011;
+        thread->CurrentFrame->State.segment_arrays[0] = gdt;
+        thread->CurrentFrame->State.cs_idx = 0;
+    }
+
+    g_exit_code = -99;
+    if (setjmp(g_exit_jmp) == 0) {
+        g_ctx->ExecuteThread(thread);
+        set_err("PE: ExecuteThread returned without exit");
+        g_exit_code = -9;
+    }
+    const int64_t rc = g_exit_code;
+    fprintf(stderr,
+            "[husk-pe] image=%p map=0x%zx sections=%u entry=0x%x stub=0x%zx exit=%lld\n",
+            image, map_size, (unsigned)pe.section_count, pe.entry_rva,
+            stub_rva, (long long)rc);
+
+    // No further guest thread will run; stop reporting an unmapped range.
+    g_code_base = 0;
+    g_code_size = 0;
+    ::munmap(stack, STACK_SIZE);
+    ::munmap(image, map_size);
+    return rc;
+}
+
+int64_t husk_pe_probe(void) {
+    g_err[0] = 0;
+    @autoreleasepool {
+        NSString *path = [[NSBundle mainBundle] pathForResource:@"hello" ofType:@"exe"];
+        if (!path) { set_err("PE: Resources/hello.exe missing from bundle"); return -1; }
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data || data.length < 0x40) {
+            set_err("PE: cannot read %s", path.fileSystemRepresentation);
+            return -2;
+        }
+        fprintf(stderr, "[husk-pe] bundle image %s (%llu bytes)\n",
+                path.fileSystemRepresentation, (unsigned long long)data.length);
+        return husk_fex_run_pe(static_cast<const uint8_t *>(data.bytes),
+                               static_cast<size_t>(data.length));
+    }
+}
+
+const char *husk_pe_last_error(void) {
     return g_err[0] ? g_err : nullptr;
 }

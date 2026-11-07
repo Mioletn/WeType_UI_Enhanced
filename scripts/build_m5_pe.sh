@@ -151,8 +151,42 @@ PY
             "$OUT/wine-pe-configure.log" | sed 's/^/    /' | tee -a "$REPORT"
     fi
     if [ -f "$PE/Makefile" ]; then
-        log "make -j4 (35 min cap) ..."
-        python3 - 2100 "$OUT/wine-pe-make.log" "$PE" make -j4 <<'PY'
+        # Madeira's ntdll/unix contains ARM64-only inline asm ("yield", dmb,
+        # wfe ...). Wine builds the unix side with the HOST compiler, which on
+        # macos-15-intel is x86_64 clang, so those mnemonics are rejected.
+        # We only want the PE binary and already have our own iOS arm64 unix
+        # lib, so neutralise those hints in the cloned source before make.
+        log "neutralising ARM64-only inline asm in ntdll/unix ..."
+        python3 - "$SRC/dlls/ntdll/unix" <<'PY' | tee -a "$REPORT"
+import glob, os, re, sys
+root = sys.argv[1]
+hints = ("yield", "wfe", "sev", "wfi", "isb", "dmb", "dsb")
+pat = re.compile(r'__asm__\s+__volatile__\(\s*"([^"]*)"\s*\)')
+
+def repl(m):
+    op = m.group(1).strip().split()
+    return '__asm__ __volatile__ ("")' if op and op[0] in hints else m.group(0)
+
+n = 0
+for p in glob.glob(os.path.join(root, "*.c")):
+    src = open(p, encoding="utf-8", errors="replace").read()
+    out = pat.sub(repl, src)
+    if out != src:
+        open(p, "w", encoding="utf-8").write(out)
+        n += 1
+        print("  patched", os.path.basename(p))
+print("  total patched files:", n)
+PY
+        log ""
+        log "== ntdll Makefile targets (first 25) =="
+        grep -E '^[a-zA-Z0-9_.$/-]+:' "$PE/dlls/ntdll/Makefile" 2>/dev/null \
+            | head -25 | sed 's/^/  /' | tee -a "$REPORT"
+        log ""
+
+        # Focus on the ntdll directory: a full `make` compiles every DLL's
+        # unix side, which drags in more Madeira/iOS-only host code.
+        log "make -j4 -C dlls/ntdll (20 min cap) ..."
+        python3 - 1200 "$OUT/wine-pe-make.log" "$PE" make -j4 -C dlls/ntdll <<'PY'
 import subprocess, sys
 secs, logf, cwd = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 cmd = sys.argv[4:]
@@ -161,11 +195,30 @@ with open(logf, "w") as f:
         rc = subprocess.call(cmd, cwd=cwd, stdout=f,
                              stderr=subprocess.STDOUT, timeout=secs)
     except subprocess.TimeoutExpired:
-        f.write("\nTIMEOUT (35 min cap)\n"); rc = 124
+        f.write("\nTIMEOUT (20 min cap)\n"); rc = 124
     f.write("\nMAKE_RC=%d\n" % rc)
 PY
         grep -E "MAKE_RC=|TIMEOUT" "$OUT/wine-pe-make.log" | tee -a "$REPORT"
-        tail -12 "$OUT/wine-pe-make.log" | sed 's/^/    /' | tee -a "$REPORT"
+        tail -14 "$OUT/wine-pe-make.log" | sed 's/^/    /' | tee -a "$REPORT"
+
+        if ! grep -q "MAKE_RC=0" "$OUT/wine-pe-make.log"; then
+            log "focused target failed; fallback to full make -j4 (15 min cap) ..."
+            python3 - 900 "$OUT/wine-pe-make-full.log" "$PE" make -j4 <<'PY'
+import subprocess, sys
+secs, logf, cwd = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+cmd = sys.argv[4:]
+with open(logf, "w") as f:
+    try:
+        rc = subprocess.call(cmd, cwd=cwd, stdout=f,
+                             stderr=subprocess.STDOUT, timeout=secs)
+    except subprocess.TimeoutExpired:
+        f.write("\nTIMEOUT (15 min cap)\n"); rc = 124
+    f.write("\nMAKE_RC=%d\n" % rc)
+PY
+            grep -E "MAKE_RC=|TIMEOUT" "$OUT/wine-pe-make-full.log" | tee -a "$REPORT"
+            tail -14 "$OUT/wine-pe-make-full.log" | sed 's/^/    /' | tee -a "$REPORT"
+            cp "$OUT/wine-pe-make-full.log" "$OUT/wine-pe-make.log" 2>/dev/null || true
+        fi
     fi
 else
     log "SKIPPED: wine source unavailable"

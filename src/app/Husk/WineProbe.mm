@@ -179,6 +179,17 @@ static void husk_protocol_probe(int master, char *out, size_t outlen)
     int reply_pipe[2] = { -1, -1 };
     int wait_pipe[2] = { -1, -1 };
     unsigned int version = 0;
+    /* Objective-C++ forbids a goto from jumping past a variable with an
+     * initializer. Every local used below is therefore declared up here,
+     * before the first "goto done"; the handshake logic itself is unchanged. */
+    unsigned char req[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
+    unsigned char rep[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
+    struct husk_init_first_thread_request *r =
+        (struct husk_init_first_thread_request *)req;
+    struct husk_reply_prefix *rp = (struct husk_reply_prefix *)rep;
+    struct pollfd pfd;
+    int pr = 0;
+    ssize_t rn = 0;
 
     struct timeval tv = { 2, 0 };
     setsockopt(master, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -247,9 +258,6 @@ static void husk_protocol_probe(int master, char *out, size_t outlen)
         }
     }
 
-    unsigned char req[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
-    struct husk_init_first_thread_request *r =
-        (struct husk_init_first_thread_request *)req;
     r->h.req = HUSK_REQ_INIT_FIRST_THREAD;
     r->h.request_size = 0;   /* no variable-sized request data */
     r->h.reply_size = 0;     /* no variable-sized reply data expected */
@@ -263,23 +271,20 @@ static void husk_protocol_probe(int master, char *out, size_t outlen)
         goto done;
     }
 
-    struct pollfd pfd;
     pfd.fd = reply_pipe[0];
     pfd.events = POLLIN;
     pfd.revents = 0;
-    int pr = poll(&pfd, 1, 3000);
+    pr = poll(&pfd, 1, 3000);
     if (pr <= 0) {
         snprintf(out, outlen, "proto=reply-timeout(poll=%d:%s)", pr,
                  pr < 0 ? strerror(errno) : "no data");
         goto done;
     }
-    unsigned char rep[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
-    ssize_t rn = read(reply_pipe[0], rep, sizeof(rep));
+    rn = read(reply_pipe[0], rep, sizeof(rep));
     if (rn < (ssize_t)sizeof(struct husk_reply_prefix)) {
         snprintf(out, outlen, "proto=short-reply(%zd)", rn);
         goto done;
     }
-    struct husk_reply_prefix *rp = (struct husk_reply_prefix *)rep;
     snprintf(out, outlen, "proto=ok ver=%u error=0x%08x pid=%u tid=%u",
              version, rp->error, rp->pid, rp->tid);
 

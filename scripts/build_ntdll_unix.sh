@@ -255,6 +255,23 @@ if [ -f "$BUILD/include/config.h" ]; then
                     "$src" > "$SRC/server/husk_request.tmp"
                 WS_SRC="$SRC/server/husk_request.tmp"
                 EXTRA="-x c -include pthread.h"
+            elif [ "$n" = process ]; then
+                # In-process wineserver: REQ_init_first_thread reports a unix_pid
+                # and thread.c stores it on the Wine process. When the last client
+                # disconnects, process_killed() -> start_sigkill_timer() ->
+                # process_sigkill() escalates to kill(unix_pid, SIGKILL), which in
+                # this build is the HOST APP's own pid. Verified on-device: the run
+                # ends with "0020: *process killed*", no crash .ips and no atexit
+                # marker -- i.e. SIGKILL, not exit(). Skip signalling when the
+                # target is ourselves; the else branch still calls process_died()
+                # so server cleanup is unchanged. The probe also sends unix_pid=-1
+                # (Wine's "no unix process" value); this TU guard protects the
+                # future PE case where a real pid has to be reported.
+                # The .tmp extension keeps it out of the *.c loop above.
+                sed -e '/static void process_sigkill/,/^}/ s|^    if (!kill( process->unix_pid, signal ) && !signal)$|    if (process->unix_pid != getpid() \&\& !kill( process->unix_pid, signal ) \&\& !signal)  /* Husk: never SIGKILL the host app */|' \
+                    "$src" > "$SRC/server/husk_process.tmp"
+                WS_SRC="$SRC/server/husk_process.tmp"
+                EXTRA="-x c"
             elif [ "$n" = mach ]; then
                 # Wine's macOS tracing branch registers the wineserver with
                 # launchd through bootstrap_register2(). An iOS app has no

@@ -283,8 +283,17 @@ static void husk_protocol_probe(int master, char *out, size_t outlen)
     r->h.req = HUSK_REQ_INIT_FIRST_THREAD;
     r->h.request_size = 0;   /* no variable-sized request data */
     r->h.reply_size = 0;     /* no variable-sized reply data expected */
-    r->unix_pid = (int)getpid();
-    r->unix_tid = 0;
+    /* Husk: this Wine "process" IS the host app. Reporting getpid() here made
+       thread.c store our own pid on the Wine process; when the probe closed its
+       only client, process_killed() -> start_sigkill_timer() -> process_sigkill()
+       escalated to kill(unix_pid, SIGKILL) and killed Husk itself. On-device:
+       "0020: *process killed*" was the final log line, no crash .ips and no
+       atexit marker -- the exact signature of SIGKILL. -1 is Wine's own value
+       for "no unix process attached": start_sigkill_timer() then calls
+       process_died() directly, with no signal. This is also accurate for a
+       protocol probe, which represents no real Windows process. */
+    r->unix_pid = -1;
+    r->unix_tid = -1;
     r->debug_level = 0;
     r->reply_fd = reply_pipe[1];
     r->wait_fd = wait_pipe[1];

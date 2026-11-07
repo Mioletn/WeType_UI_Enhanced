@@ -7,9 +7,11 @@
  * probe waits for it to publish its socket, then connects to it.
  *
  * A 0 return means: wineserver initialised, created its listening socket inside
- * the prefix, and accepted a connection. -1 is a setup failure, -2 means the
- * server never published a socket, -3 means the socket existed but refused the
- * connection. The detail line goes to Documents/husk-wine-probe.log.
+ * the prefix, accepted a connection, and its thread was still in main_loop
+ * after a settling delay. -1 is a setup failure, -2 means the server never
+ * published a socket, -3 means the socket refused the connection, -4 means
+ * the wineserver thread exited right after the connection.
+ * The detail line goes to Documents/husk-wine-probe.log.
  */
 #import <Foundation/Foundation.h>
 
@@ -36,6 +38,7 @@ extern "C" int wineserver_main(int argc, char **argv);
 
 static volatile int g_ws_returned;
 static volatile int g_ws_result;
+static int g_nls_bundled;
 static char g_error[512];
 
 static void set_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -57,7 +60,7 @@ static double now_ms(void)
 /* fatal_error() in the Husk build ends the wineserver thread with
  * pthread_exit() instead of exit(1). Cleanup handlers still run on
  * pthread_exit, so this lets the probe distinguish "the server thread died
- * early" (2) from "it returned normally" (1) and "still starting" (0). */
+ * early" (2) from "it returned normally" (1) and "running in main_loop" (0). */
 static void ws_thread_cleanup(void *unused)
 {
     g_ws_returned = 2;
@@ -65,8 +68,9 @@ static void ws_thread_cleanup(void *unused)
 
 static void *wineserver_thread(void *unused)
 {
-    /* -f stays in the foreground (do not fork), -p persists, -d suppresses the
-     * debug output that would otherwise sit on a socket. */
+    /* -f stays in the foreground (do not fork), -p persists (no idle-exit
+     * timeout), -d (no argument) bumps debug_level so wineserver prints its
+     * "starting" line, the on-device proof that it reached main(). */
     static char a0[] = "wineserver", a1[] = "-f", a2[] = "-p", a3[] = "-d";
     char *argv[] = { a0, a1, a2, a3, NULL };
 
@@ -137,6 +141,7 @@ int32_t husk_wine_probe(void)
 {
     @autoreleasepool {
         const double t0 = now_ms();
+        g_nls_bundled = 0;
         NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *docs = dirs.firstObject;
         NSString *prefix = [docs stringByAppendingPathComponent:@"wineprefix"];
@@ -148,6 +153,24 @@ int32_t husk_wine_probe(void)
         if (err) {
             set_error("mkdir prefix: %s", err.localizedDescription.UTF8String);
             return -1;
+        }
+
+        /* server/unicode.c must open l_intl.nls (the Unicode casemap table)
+         * before wineserver can start. Desktop Wine looks in DATADIR/wine/nls
+         * and /usr/share/wine/nls, neither of which exists in an app bundle.
+         * The Husk build of unicode.c prefers WINE_NLS_DIR, so stage the
+         * bundled copy inside the prefix and point it there. */
+        NSString *nlsDir = [prefix stringByAppendingPathComponent:@"nls"];
+        [fm createDirectoryAtPath:nlsDir withIntermediateDirectories:YES
+                       attributes:nil error:nil];
+        NSString *nlsDst = [nlsDir stringByAppendingPathComponent:@"l_intl.nls"];
+        NSString *nlsSrc = [[NSBundle mainBundle] pathForResource:@"l_intl" ofType:@"nls"];
+        if (nlsSrc) {
+            if ([fm fileExistsAtPath:nlsDst]) [fm removeItemAtPath:nlsDst error:nil];
+            if ([fm copyItemAtPath:nlsSrc toPath:nlsDst error:nil]) {
+                setenv("WINE_NLS_DIR", nlsDir.fileSystemRepresentation, 1);
+                g_nls_bundled = 1;
+            }
         }
 
         /* wineserver reads both; WINEPREFIX decides where the socket goes and
@@ -186,27 +209,45 @@ int32_t husk_wine_probe(void)
 
         double waited = now_ms() - t0;
         const char *ws_state = g_ws_returned == 2 ? "thread exited early (fatal_error)"
-                             : g_ws_returned == 1 ? "returned"
-                             : "still starting";
+                             : g_ws_returned == 1 ? "returned before main_loop"
+                             : "running in main_loop";
+        const char *nls_state = g_nls_bundled ? "nls=bundle" : "nls=system-fallback";
 
         if (!found) {
-            set_error("no socket after %.0fms in %s (wineserver %s rc=%d)",
-                      waited, prefix.UTF8String, ws_state, g_ws_result);
+            set_error("no socket after %.0fms in %s (wineserver %s rc=%d, %s)",
+                      waited, prefix.UTF8String, ws_state, g_ws_result, nls_state);
             return -2;
         }
 
         const char *sock_path = found.fileSystemRepresentation;
         int ce = connect_unix(sock_path);
         if (ce != 0) {
-            set_error("socket %s refused: %s (path %lu chars, wineserver %s)",
+            set_error("socket %s refused: %s (path %lu chars, wineserver %s, %s)",
                       found.lastPathComponent.UTF8String, strerror(ce),
-                      (unsigned long)strlen(sock_path), ws_state);
+                      (unsigned long)strlen(sock_path), ws_state, nls_state);
             return -3;
         }
 
-        set_error("ok in %.0fms, socket %s (%lu chars), wineserver %s",
+        /* connect() alone only proves that something is listening. Give
+         * wineserver time to finish init_registry()/main_loop() and verify the
+         * server thread is still alive -- a fatal_error() after the socket is
+         * published would otherwise be reported as a success. */
+        usleep(1500 * 1000);
+        waited = now_ms() - t0;
+        if (g_ws_returned != 0) {
+            set_error("wineserver %s after connect (rc=%d, %s)",
+                      g_ws_returned == 2 ? "thread exited early" : "returned",
+                      g_ws_result, nls_state);
+            return -4;
+        }
+        if (![fm fileExistsAtPath:found]) {
+            set_error("socket disappeared after connect (%s)", nls_state);
+            return -4;
+        }
+
+        set_error("ok in %.0fms, socket %s (%lu chars), wineserver %s, %s",
                   waited, found.lastPathComponent.UTF8String,
-                  (unsigned long)strlen(sock_path), ws_state);
+                  (unsigned long)strlen(sock_path), ws_state, nls_state);
         return 0;
     }
 }

@@ -234,6 +234,20 @@ if [ -f "$BUILD/include/config.h" ]; then
                     "$src" > "$SRC/server/husk_mach.tmp"
                 WS_SRC="$SRC/server/husk_mach.tmp"
                 EXTRA="-x c"
+            elif [ "$n" = unicode ]; then
+                # load_intl_file() searches DATADIR/wine/nls and /usr/share/wine/nls
+                # for l_intl.nls. None of those desktop paths exist in an app
+                # bundle, and a miss is fatal_error("failed to load l_intl.nls").
+                # On __APPLE__ get_nls_dir() derives the path from the main
+                # executable, so even argv[0] cannot steer it. Prefer an
+                # explicit WINE_NLS_DIR (set by WineProbe.mm to the copy of
+                # l_intl.nls bundled with the app) before falling back.
+                # stdlib.h is needed for getenv(): unicode.c does not include
+                # it, and an implicit declaration would truncate the pointer.
+                sed 's|    nls_dirs\[0\] = get_nls_dir();|    nls_dirs[0] = getenv("WINE_NLS_DIR"); if (!nls_dirs[0]) nls_dirs[0] = get_nls_dir();|' \
+                    "$src" > "$SRC/server/husk_unicode.tmp"
+                WS_SRC="$SRC/server/husk_unicode.tmp"
+                EXTRA="-x c -include stdlib.h"
             fi
             if xcrun --sdk iphoneos clang \
                 -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$MIN" \

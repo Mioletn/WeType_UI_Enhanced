@@ -183,10 +183,11 @@ PY
             | head -25 | sed 's/^/  /' | tee -a "$REPORT"
         log ""
 
-        # Focus on the ntdll directory: a full `make` compiles every DLL's
-        # unix side, which drags in more Madeira/iOS-only host code.
-        log "make -j4 -C dlls/ntdll (20 min cap) ..."
-        python3 - 1200 "$OUT/wine-pe-make.log" "$PE" make -j4 -C dlls/ntdll <<'PY'
+        # Round 3: the full build had ZERO compile errors and was already
+        # emitting ntdll.dll's version resources at 75% of the log -- it was
+        # cut off only by the 15 min cap. Give it a full hour this time.
+        log "make -j4 full Wine build (60 min cap) ..."
+        python3 - 3600 "$OUT/wine-pe-make.log" "$PE" make -j4 <<'PY'
 import subprocess, sys
 secs, logf, cwd = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 cmd = sys.argv[4:]
@@ -195,30 +196,15 @@ with open(logf, "w") as f:
         rc = subprocess.call(cmd, cwd=cwd, stdout=f,
                              stderr=subprocess.STDOUT, timeout=secs)
     except subprocess.TimeoutExpired:
-        f.write("\nTIMEOUT (20 min cap)\n"); rc = 124
+        f.write("\nTIMEOUT (60 min cap)\n"); rc = 124
     f.write("\nMAKE_RC=%d\n" % rc)
 PY
         grep -E "MAKE_RC=|TIMEOUT" "$OUT/wine-pe-make.log" | tee -a "$REPORT"
         tail -14 "$OUT/wine-pe-make.log" | sed 's/^/    /' | tee -a "$REPORT"
-
-        if ! grep -q "MAKE_RC=0" "$OUT/wine-pe-make.log"; then
-            log "focused target failed; fallback to full make -j4 (15 min cap) ..."
-            python3 - 900 "$OUT/wine-pe-make-full.log" "$PE" make -j4 <<'PY'
-import subprocess, sys
-secs, logf, cwd = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-cmd = sys.argv[4:]
-with open(logf, "w") as f:
-    try:
-        rc = subprocess.call(cmd, cwd=cwd, stdout=f,
-                             stderr=subprocess.STDOUT, timeout=secs)
-    except subprocess.TimeoutExpired:
-        f.write("\nTIMEOUT (15 min cap)\n"); rc = 124
-    f.write("\nMAKE_RC=%d\n" % rc)
-PY
-            grep -E "MAKE_RC=|TIMEOUT" "$OUT/wine-pe-make-full.log" | tee -a "$REPORT"
-            tail -14 "$OUT/wine-pe-make-full.log" | sed 's/^/    /' | tee -a "$REPORT"
-            cp "$OUT/wine-pe-make-full.log" "$OUT/wine-pe-make.log" 2>/dev/null || true
-        fi
+        log ""
+        log "== PE DLLs produced (first 20) =="
+        find "$PE" -path "*x86_64-windows*" -name "*.dll" -type f 2>/dev/null \
+            | head -20 | sed 's/^/  /' | tee -a "$REPORT"
     fi
 else
     log "SKIPPED: wine source unavailable"

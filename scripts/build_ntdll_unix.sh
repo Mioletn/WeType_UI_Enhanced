@@ -91,7 +91,10 @@ CFLAGS=(
     -Wno-implicit-function-declaration -Wno-int-conversion
     -include "$BUILD/include/config.h"
     -include "$SHIMS/shims/wine_ios_exit.h"
-    -I"$SHIMS/shims" -DHAVE_LINUX_NTSYNC_H=1
+    # No -DHAVE_LINUX_NTSYNC_H: that switches sync.c onto <linux/ntsync.h>,
+    # which only exists in Madeira's madsync project. Without it sync.c uses
+    # the futex/esync paths, which is what we want until ntsync is built.
+    -I"$SHIMS/shims" -I"$SHIMS"
     -I"$BUILD/dlls/ntdll" -I"$SRC/dlls/ntdll" -I"$SRC/dlls/ntdll/unix"
     -I"$BUILD/include" -I"$SRC/include"
     -D__WINESRC__ -DLTC_NO_PROTOTYPES -DLTC_SOURCE -D_NTSYSTEM_
@@ -141,6 +144,15 @@ for src in "$SRC"/dlls/ntdll/unix/*.c; do
     repl="$(replacement_for "$name")"
     if [ -n "$repl" ] && [ -f "$SHIMS/$repl" ]; then
         compile "$SHIMS/$repl" "$name"
+    elif grep -q 'build/madeira_cfg\.h' "$src" 2>/dev/null; then
+        # sync.c and system.c reach for Madeira's config header through a
+        # relative path that only exists in their tree. Rewrite that one
+        # include to the copy in wine-ios/ntdll and compile the result from
+        # the object dir (the include search path covers the rest).
+        sed -e 's|"[^"]*build/madeira_cfg\.h"|"madeira_cfg.h"|' \
+            -e 's/__builtin_available( macOS 14\.4, \* )/__builtin_available( macOS 14.4, iOS 17.4, * )/' \
+            "$src" > "$OBJ/$name.patched.c"
+        compile "$OBJ/$name.patched.c" "$name"
     else
         compile "$src" "$name"
     fi
@@ -152,6 +164,95 @@ echo "== $OK compiled, $BAD failed ==" | tee -a "$OUT/ntdll-summary.txt"
 if ls "$OBJ"/*.o >/dev/null 2>&1; then
     ar rcs "$LIBDIR/libntdll_unix.a" "$OBJ"/*.o
     echo "    libntdll_unix.a $(wc -c < "$LIBDIR/libntdll_unix.a" | tr -d ' ') bytes"
+fi
+
+# --- M1b probe: wineserver ---------------------------------------------------
+# Madeira patches an existing libwineserver.a, which assumes a full Wine build.
+# The question this answers is whether that indirection is actually needed: if
+# server/*.c compiles straight against a generated request.h, wineserver is just
+# another compile step and the prebuilt archive can be skipped entirely.
+if [ -f "$BUILD/include/config.h" ]; then
+    echo ""
+    echo "==> availability warnings (APIs newer than iOS $MIN)"
+    # These compile but would be missing symbols at run time on 12.2 -- the same
+    # class of failure as std::pmr. This list is the runtime backfill work.
+    grep -h "only available on iOS" "$OUT"/*.err 2>/dev/null \
+        | sed "s/.*warning: '//; s/' is only available.*//" \
+        | sort | uniq -c | sort -rn | head -20
+
+    echo ""
+    # request.h, request_handlers.h and request_trace.h are generated files that
+    # this fork commits, so there is nothing to run: server/*.c compiles straight
+    # against $SRC/server. (tools/make_requests only writes server_protocol.h,
+    # request_trace.h and request_handlers.h -- not request.h.)
+    if [ -s "$SRC/server/request.h" ]; then
+        echo "==> wineserver: request.h present ($(wc -c < "$SRC/server/request.h" | tr -d ' ') bytes)"
+        WS_OK=0
+        WS_BAD=0
+        : > "$OUT/wineserver-summary.txt"
+        for src in "$SRC"/server/*.c; do
+            n="$(basename "$src" .c)"
+            # server/main.c defines main(); rename it so the app can start
+            # wineserver on its own thread instead of a process.
+            EXTRA=""
+            [ "$n" = main ] && EXTRA="-Dmain=wineserver_main"
+            if xcrun --sdk iphoneos clang \
+                -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$MIN" \
+                -O1 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+                -Wno-implicit-function-declaration -Wno-int-conversion \
+                -include "$BUILD/include/config.h" \
+                -include "$ROOT/wine-ios/wineserver/config_ios.h" \
+                -include stdarg.h \
+                -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\" \
+                -I"$BUILD/include" -I"$SRC/include" -I"$SRC/include/wine" \
+                -I"$BUILD" -I"$SRC/server" -I"$SHIMS/shims" -I"$SHIMS" \
+                -D__WINESRC__ -DWINE_IOS=1 \
+                $EXTRA \
+                -c "$src" -o "$OBJ/ws-$n.o" 2> "$OUT/ws-$n.err"; then
+                WS_OK=$((WS_OK + 1)); echo "OK   $n" >> "$OUT/wineserver-summary.txt"
+            else
+                WS_BAD=$((WS_BAD + 1)); echo "FAIL $n" >> "$OUT/wineserver-summary.txt"
+            fi
+        done
+        echo "    wineserver: $WS_OK ok, $WS_BAD failed"
+        cat "$OUT/wineserver-summary.txt" | grep -c '^OK' > /dev/null || true
+        grep '^FAIL' "$OUT/wineserver-summary.txt" || echo "    (no failures)"
+        if ls "$OBJ"/ws-*.o >/dev/null 2>&1; then
+            ar rcs "$LIBDIR/libwineserver_unix.a" "$OBJ"/ws-*.o
+            echo "    libwineserver_unix.a $(wc -c < "$LIBDIR/libwineserver_unix.a" | tr -d ' ') bytes"
+        fi
+        for e in "$OUT"/ws-*.err; do
+            [ -s "$e" ] && { echo "### $(basename "$e")"; grep -m3 "error:" "$e"; }
+        done
+    fi
+fi
+
+# --- link probe --------------------------------------------------------------
+# Compiling proves the sources are portable; linking proves the two archives
+# agree with each other and with iOS. Undefined symbols here are the real
+# remaining work, listed by name instead of as a crash on the device.
+if [ -f "$LIBDIR/libntdll_unix.a" ] && [ -f "$LIBDIR/libwineserver_unix.a" ]; then
+    echo ""
+    echo "==> link probe (ntdll_unix + wineserver_unix)"
+    printf 'int wineserver_main(int, char **);\nint husk_link_probe(void){ return 0; }\n' \
+        > "$OBJ/linkprobe.c"
+    if xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min="$MIN" -c "$OBJ/linkprobe.c" -o "$OBJ/linkprobe.o" \
+            2> "$OUT/linkprobe.err" && \
+       xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min="$MIN" -dynamiclib -Wl,-undefined,error \
+            -o "$OUT/libhusk-wine-probe.dylib" "$OBJ/linkprobe.o" \
+            "$LIBDIR/libntdll_unix.a" "$LIBDIR/libwineserver_unix.a" \
+            -framework CoreFoundation -framework Security \
+            2> "$OUT/link.log"; then
+        echo "    link OK"
+    else
+        echo "    link FAILED -- undefined symbols:"
+        grep -o '"_[A-Za-z0-9_]*", referenced from' "$OUT/link.log" 2>/dev/null \
+            | sed 's/", referenced from//; s/"//' | sort -u | head -25
+        grep -c 'referenced from' "$OUT/link.log" 2>/dev/null | sed 's/^/    total refs: /'
+        tail -3 "$OUT/link.log"
+    fi
 fi
 
 for e in "$OUT"/*.err; do

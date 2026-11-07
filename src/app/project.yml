@@ -130,6 +130,10 @@ targets:
           - "-lz"
           # FEXCore, built by scripts/build_fex_ios.sh (Madeira-lite M0).
           - "-lFEXCore_all"
+          # Wine's unix side, built by scripts/build_ntdll_unix.sh (M1a/M1b).
+          # Both land in build/ios-arm64/lib, already on LIBRARY_SEARCH_PATHS.
+          - "-lntdll_unix"
+          - "-lwineserver_unix"
           # libresolv: the phone's DNS servers, for games that resolve names themselves (Geode's c-ares).
           - "-lresolv"
           # SQLite for Java apps' android.database.sqlite (the system's own library).

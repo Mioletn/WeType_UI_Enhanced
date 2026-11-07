@@ -48,6 +48,24 @@ final class LegacyRootViewController: UITabBarController {
             }
         }
 
+        // Wine runtime probe (Madeira-lite M1e). Same marker discipline: with
+        // Documents/husk-wine-probe present, wineserver is started on a
+        // background thread and the probe waits for its socket. Result goes to
+        // Documents/husk-wine-probe.log.
+        let wineMarker = (docs as NSString).appendingPathComponent("husk-wine-probe")
+        if FileManager.default.fileExists(atPath: wineMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let rc = husk_wine_probe()
+                var msg = "husk-wine-probe: rc=\(rc)"
+                if let e = husk_wine_last_error() {
+                    msg += " \(String(cString: e))"
+                }
+                HuskLog.log("wine", msg)
+                let logPath = (docs as NSString).appendingPathComponent("husk-wine-probe.log")
+                try? (msg + "\n").write(toFile: logPath, atomically: true, encoding: .utf8)
+            }
+        }
+
         // DEBUG auto-start: when this flag file is present, begin the QEMU guest
         // a few seconds after launch so the Emulation bring-up can be exercised
         // and its serial log captured with no UI interaction. Used for headless

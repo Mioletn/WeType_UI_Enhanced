@@ -16,6 +16,7 @@
 
 /* FEXCore probe (Madeira-lite M0): husk_fex_probe() / husk_fex_last_error(). */
 #include "FEXBridge.h"
+#include "WineProbe.h"
 
 /* Mirrors HuskFrameInfo in husk-display.h. */
 typedef struct HuskFrameInfo {

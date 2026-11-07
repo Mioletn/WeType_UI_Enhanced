@@ -2,4 +2,3 @@ Marker: run the M1 Wine probe as part of build-ipa.
 
 Delete this file to stop paying for Wine's clone and configure on every build.
 The report is written to build/logs/m1/ and uploaded with the IPA.
-attempt = 1

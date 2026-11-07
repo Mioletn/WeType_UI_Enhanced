@@ -63,6 +63,18 @@ static volatile int g_ws_result;
 static int g_nls_bundled;
 static char g_error[512];
 
+/* M6b retained channel. husk_wine_probe() normally closes everything at the
+ * end of husk_protocol_probe(), which makes wineserver destroy the client's
+ * process/thread. A guest syscall needs that state to survive, so the M6b
+ * launcher sets g_ws_keep before calling husk_wine_probe() and the handshake
+ * leaves these fds open. */
+static int g_ws_keep = 0;
+static int g_ws_master = -1;
+static int g_ws_reqfd = -1;
+static int g_ws_reply_read = -1;
+static int g_ws_reply_write = -1;
+static int g_ws_wait_write = -1;
+
 /* In-process lifetime diagnostics. wineserver was written to own a whole
  * process: several shutdown paths call exit(). Running it on a thread inside
  * Husk makes any of those calls terminate the app. These markers go straight
@@ -195,12 +207,13 @@ static NSString *find_socket(NSString *root, int max_depth)
  *   way, and writes a 64-byte union generic_request to the request fd. Only
  *   REQ_init_first_thread installs current->reply_fd; without it
  *   call_req_handler() kills the thread instead of sending a reply. */
-static void husk_protocol_probe(int master, char *out, size_t outlen)
+static void husk_protocol_probe(int master, char *out, size_t outlen, int keep)
 {
     int reqfd = -1;
     int reply_pipe[2] = { -1, -1 };
     int wait_pipe[2] = { -1, -1 };
     unsigned int version = 0;
+    int ok = 0;   /* declared before every goto, like all locals below */
     /* Objective-C++ forbids a goto from jumping past a variable with an
      * initializer. Every local used below is therefore declared up here,
      * before the first "goto done"; the handshake logic itself is unchanged. */
@@ -318,13 +331,98 @@ static void husk_protocol_probe(int master, char *out, size_t outlen)
     }
     snprintf(out, outlen, "proto=ok ver=%u error=0x%08x pid=%u tid=%u",
              version, rp->error, rp->pid, rp->tid);
+    ok = 1;
 
 done:
-    if (reqfd >= 0) close(reqfd);
-    for (int k = 0; k < 2; k++) {
-        if (reply_pipe[k] >= 0) close(reply_pipe[k]);
-        if (wait_pipe[k] >= 0) close(wait_pipe[k]);
+    if (keep && ok) {
+        /* M6b: REQ_init_first_thread installed current->reply_fd and created
+         * the Wine process/thread. Keeping the client fds alive keeps that
+         * state, so the guest can send further requests on g_ws_reqfd and
+         * collect each 64-byte reply on g_ws_reply_read. */
+        g_ws_master = master;
+        g_ws_reqfd = reqfd;
+        g_ws_reply_read = reply_pipe[0];
+        g_ws_reply_write = reply_pipe[1];
+        g_ws_wait_write = wait_pipe[1];
+        if (wait_pipe[0] >= 0) close(wait_pipe[0]);  /* never read by us */
+    } else {
+        if (reqfd >= 0) close(reqfd);
+        for (int k = 0; k < 2; k++) {
+            if (reply_pipe[k] >= 0) close(reply_pipe[k]);
+            if (wait_pipe[k] >= 0) close(wait_pipe[k]);
+        }
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * M6b: retain the wineserver channel and forward guest syscalls to it.
+ * ------------------------------------------------------------------------- */
+static void husk_ws_trace(int req_id, unsigned int status, int rc, ssize_t n)
+{
+    char buf[192];
+    int len = snprintf(buf, sizeof(buf),
+                       "[husk-m6b] ws-call req=%d status=0x%08x rc=%d bytes=%zd\n",
+                       req_id, status, rc, n);
+    if (len > 0) write(2, buf, (size_t)len);
+}
+
+int32_t husk_ws_call(int req_id, const void *payload, size_t payload_size,
+                     unsigned int *out_status)
+{
+    ssize_t nw = 0;
+    ssize_t nr = 0;
+    unsigned int status = 0;
+    unsigned char req[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
+    unsigned char rep[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
+    struct husk_request_header *h = (struct husk_request_header *)req;
+    struct husk_reply_prefix *rp = (struct husk_reply_prefix *)rep;
+    struct pollfd pfd;
+    int pr = 0;
+
+    if (g_ws_reqfd < 0 || g_ws_reply_read < 0) return -1;
+    if (payload_size > HUSK_GENERIC_REQUEST_SIZE - sizeof(*h)) return -2;
+
+    /* read_request() always reads sizeof(union generic_request) == 64 bytes;
+     * request_size/reply_size stay 0 for fixed-size requests. */
+    h->req = req_id;
+    h->request_size = 0;
+    h->reply_size = 0;
+    if (payload && payload_size)
+        memcpy(req + sizeof(*h), payload, payload_size);
+
+    nw = write(g_ws_reqfd, req, sizeof(req));
+    if (nw != (ssize_t)sizeof(req)) {
+        husk_ws_trace(req_id, 0, -3, nw);
+        return -3;
+    }
+    pfd.fd = g_ws_reply_read;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    pr = poll(&pfd, 1, 3000);
+    if (pr <= 0) {
+        husk_ws_trace(req_id, 0, -4, (ssize_t)pr);
+        return -4;
+    }
+    nr = read(g_ws_reply_read, rep, sizeof(rep));
+    if (nr < (ssize_t)sizeof(struct husk_reply_prefix)) {
+        husk_ws_trace(req_id, 0, -5, nr);
+        return -5;
+    }
+    status = rp->error;
+    if (out_status) *out_status = status;
+    husk_ws_trace(req_id, status, 0, nr);
+    return 0;
+}
+
+int husk_ws_is_ready(void)
+{
+    return g_ws_reqfd >= 0 && g_ws_reply_read >= 0;
+}
+
+int32_t husk_ws_start(void)
+{
+    g_ws_keep = 1;
+    return husk_wine_probe();
 }
 
 int32_t husk_wine_probe(void)
@@ -450,8 +548,11 @@ int32_t husk_wine_probe(void)
          * This is an add-on diagnostic -- its outcome is appended to the
          * result line, never used to fail the already-proven A route. */
         char proto[256] = "proto=skipped";
-        husk_protocol_probe(master, proto, sizeof(proto));
-        close(master);
+        husk_protocol_probe(master, proto, sizeof(proto), g_ws_keep);
+        /* In M6b the handshake retained master/reqfd/reply fds; closing the
+         * client master would make wineserver tear down the Wine process we
+         * need for the guest's syscalls. If the handshake failed, close it. */
+        if (g_ws_master < 0) close(master);
         const char *ws_after = g_ws_returned == 0 ? "alive" : "died";
 
         set_error("ok in %.0fms, socket %s (%lu chars), wineserver %s, %s, %s, ws_after_proto=%s",

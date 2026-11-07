@@ -62,6 +62,14 @@ const char *husk_pe_last_error(void);
  * Documents/husk-m6-probe marker instead of husk-pe-probe. */
 int64_t husk_m6_probe(void);
 
+/* M6b: same guest program and the same four Windows syscalls, but
+ * NtQueryInformationProcess is forwarded to the in-process wineserver as a
+ * real REQ_get_process_info request and the server's NTSTATUS is returned to
+ * the guest. Requires husk_ws_start() to have run first in this launch; the
+ * husk-m6b-probe marker does that in Swift. Returns 42 only when the server
+ * round trip completed AND all four syscalls passed their checks. */
+int64_t husk_m6b_probe(void);
+
 /* Human-readable reason for the last M6 failure, or NULL. */
 const char *husk_m6_last_error(void);
 

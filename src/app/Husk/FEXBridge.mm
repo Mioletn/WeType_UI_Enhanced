@@ -19,6 +19,7 @@
  */
 #include "FEXBridge.h"
 #include "HuskWinSyscalls.h"
+#include "WineProbe.h"   /* M6b: forward a guest syscall to wineserver */
 
 // Xcode defines DEBUG=1, which collides with LogMan::DEBUG.
 #ifdef DEBUG
@@ -110,6 +111,13 @@ static int64_t g_exit_code = 0;
 static bool g_win_mode = false;
 static uint32_t g_win_seq = 0;   // Windows syscalls seen, in order
 static uint32_t g_win_hits = 0;  // bit n set when expected call n matched
+
+// M6b: only husk_m6b_probe() arms this. It routes one of the four guest
+// Windows syscalls through the retained wineserver channel instead of
+// answering locally, and the probe's verdict requires that round trip to
+// succeed; M0/M5/M6a never set it.
+static bool g_win_use_ws = false;
+static bool g_ws_call_ok = false;
 
 // Defined in the M6 section below (kept inside the strict-syntax fixture's
 // slice, which starts at the M5 banner).
@@ -458,10 +466,14 @@ static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
     return true;
 }
 
-static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size, bool win_mode) {
+static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
+                               bool win_mode, bool use_ws) {
     // M6: arm the Windows syscall dispatcher only for the probe that owns this
     // launch's single guest thread. M0/M5 pass false and keep the Linux path.
+    // M6b additionally arms the wineserver forwarding for one syscall.
     g_win_mode = win_mode;
+    g_win_use_ws = use_ws;
+    g_ws_call_ok = false;
     g_win_seq = 0;
     g_win_hits = 0;
     // A launch runs exactly ONE guest program. The PE marker does not run the
@@ -671,9 +683,17 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size, bool win_m
                     (unsigned)g_win_hits, (unsigned)g_win_seq);
             result = -31;
         }
+        if (use_ws && !g_ws_call_ok) {
+            // M6b's whole point is the guest -> wineserver -> guest round
+            // trip. rc=42 alone must not be reported as success if the server
+            // request never completed.
+            set_err("M6b: wineserver request did not complete");
+            result = -32;
+        }
     }
 
     g_win_mode = false;
+    g_win_use_ws = false;
     // No further guest thread will run; stop reporting an unmapped range.
     g_code_base = 0;
     g_code_size = 0;
@@ -682,7 +702,7 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size, bool win_m
     return result;
 }
 
-static int64_t husk_bundle_pe_probe(bool win_mode) {
+static int64_t husk_bundle_pe_probe(bool win_mode, bool use_ws) {
     g_err[0] = 0;
     // hello.exe sits next to the executable in Husk.app (project.yml copies
     // Resources/** to the bundle root, exactly like l_intl.nls). Both M5 and
@@ -720,14 +740,14 @@ static int64_t husk_bundle_pe_probe(bool win_mode) {
         return -4;
     }
     fprintf(stderr, "[husk-%s] bundle image %s (%zu bytes)\n",
-            win_mode ? "m6" : "pe", path, got);
-    const int64_t rc = husk_fex_run_pe(buf, got, win_mode);
+            use_ws ? "m6b" : (win_mode ? "m6" : "pe"), path, got);
+    const int64_t rc = husk_fex_run_pe(buf, got, win_mode, use_ws);
     delete[] buf;
     return rc;
 }
 
 int64_t husk_pe_probe(void) {
-    return husk_bundle_pe_probe(false);
+    return husk_bundle_pe_probe(false, false);
 }
 
 const char *husk_pe_last_error(void) {
@@ -787,6 +807,25 @@ static uint64_t husk_win_dispatch(FEXCore::HLE::SyscallArguments *args) {
         return 0x00000000u; // STATUS_SUCCESS
     case 25: // NtQueryInformationProcess
         if (a1 == 0x2222u && a2 == 0x3333u) HUSK_WIN_HIT(1);
+        if (g_win_use_ws) {
+            // M6b: this is the first guest Windows syscall that reaches the
+            // in-process wineserver. REQ_get_process_info is 9 in the local
+            // server_protocol.h (gen_m6b_layout.py asserts the enum); its
+            // only field is `obj_handle_t handle` at offset 12, and
+            // handle.c's get_magic_handle() maps 0xffffffff to
+            // current->process, so no real handle table entry is needed.
+            // The 64-byte reply carries the NTSTATUS in reply_header.error,
+            // exactly the value the guest expects back in RAX.
+            const uint32_t pseudo_handle = 0xffffffffu;
+            unsigned int status = 0;
+            const int32_t rc = husk_ws_call(9, &pseudo_handle,
+                                            sizeof(pseudo_handle), &status);
+            if (rc == 0) {
+                g_ws_call_ok = true;
+                return status;
+            }
+            return 0xC0000001ULL; // STATUS_UNSUCCESSFUL
+        }
         return 0x00000000u; // STATUS_SUCCESS (probe passes no output buffer)
     case 85: // NtCreateFile: deliberately not routed to wineserver yet.
         if (a1 == 0x4444u && a2 == 0x5555u) HUSK_WIN_HIT(2);
@@ -803,7 +842,17 @@ static uint64_t husk_win_dispatch(FEXCore::HLE::SyscallArguments *args) {
 }
 
 int64_t husk_m6_probe(void) {
-    return husk_bundle_pe_probe(true);
+    return husk_bundle_pe_probe(true, false);
+}
+
+int64_t husk_m6b_probe(void) {
+    // The Swift launcher calls husk_ws_start() first, so the retained
+    // wineserver channel is live before the guest thread is created.
+    if (!husk_ws_is_ready()) {
+        set_err("M6b: wineserver channel is not ready");
+        return -33;
+    }
+    return husk_bundle_pe_probe(true, true);
 }
 
 const char *husk_m6_last_error(void) {

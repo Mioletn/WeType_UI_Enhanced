@@ -11,13 +11,19 @@
  * after a settling delay. -1 is a setup failure, -2 means the server never
  * published a socket, -3 means the socket refused the connection, -4 means
  * the wineserver thread exited right after the connection.
- * The detail line goes to Documents/husk-wine-probe.log.
+ *
+ * M2 adds a real Wine server request/reply round trip on that same connection
+ * (SCM_RIGHTS fd handshake + REQ_init_first_thread). It is an add-on
+ * diagnostic: the outcome is appended to the result line as "proto=..." and
+ * never changes the A-route return code. The detail line goes to
+ * Documents/husk-wine-probe.log.
  */
 #import <Foundation/Foundation.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -30,6 +36,22 @@
 #include <unistd.h>
 
 #include "WineProbe.h"
+
+/* M2 wire constants, mirrored from include/wine/server_protocol.h in the
+ * willfaust/wine fork. scripts/build_ntdll_unix.sh asserts all four against
+ * the fork source at build time, so a protocol bump cannot silently break
+ * this probe (it fails the build instead of lying on-device). */
+#define HUSK_SERVER_PROTOCOL_VERSION 930
+#define HUSK_REQ_INIT_FIRST_THREAD   5
+#define HUSK_GENERIC_REQUEST_SIZE   64  /* struct request_max_size = int[16] */
+
+struct husk_request_header { int req; unsigned int request_size; unsigned int reply_size; };
+struct husk_init_first_thread_request {
+    struct husk_request_header h;
+    int unix_pid, unix_tid, debug_level, reply_fd, wait_fd;
+};
+struct husk_send_fd { unsigned int tid; int fd; };
+struct husk_reply_prefix { unsigned int error, reply_size, pid, tid; };
 
 /* extern "C": the archive defines this as a C symbol (_wineserver_main), and
  * this file is Objective-C++, which would otherwise look for the mangled name.
@@ -81,8 +103,9 @@ static void *wineserver_thread(void *unused)
     return NULL;
 }
 
-static int connect_unix(const char *path)
+static int connect_unix(const char *path, int *out_fd)
 {
+    *out_fd = -1;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return errno;
 
@@ -115,7 +138,8 @@ static int connect_unix(const char *path)
     int e = rc == 0 ? 0 : errno;
     if (relative && saved >= 0) fchdir(saved);
     if (saved >= 0) close(saved);
-    close(fd);
+    if (e == 0) *out_fd = fd;   /* M2 keeps this fd for the protocol handshake */
+    else close(fd);
     return e;
 }
 
@@ -135,6 +159,136 @@ static NSString *find_socket(NSString *root, int max_depth)
         if ([fm fileExistsAtPath:full isDirectory:&is_dir] && !is_dir) return full;
     }
     return nil;
+}
+
+/* M2: exercise the real Wine server request/reply path on the connected
+ * master socket. This is deliberately an ADD-ON diagnostic: a failure here is
+ * reported in the result line but does not change husk_wine_probe()'s return
+ * code, so the M1/A-route verdict cannot regress because of an M2 experiment.
+ *
+ * Handshake (server/request.c, server/thread.c, dlls/ntdll/unix/server.c):
+ *   accept() -> create_process() -> create_thread(-1) which pipes a request
+ *   fd to the client via SCM_RIGHTS, with SERVER_PROTOCOL_VERSION in the
+ *   payload. The client then passes a reply fd and a wait fd back the same
+ *   way, and writes a 64-byte union generic_request to the request fd. Only
+ *   REQ_init_first_thread installs current->reply_fd; without it
+ *   call_req_handler() kills the thread instead of sending a reply. */
+static void husk_protocol_probe(int master, char *out, size_t outlen)
+{
+    int reqfd = -1;
+    int reply_pipe[2] = { -1, -1 };
+    int wait_pipe[2] = { -1, -1 };
+    unsigned int version = 0;
+
+    struct timeval tv = { 2, 0 };
+    setsockopt(master, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* server -> client: 4-byte obj_handle_t payload + SCM_RIGHTS request fd */
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    struct iovec iov;
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    iov.iov_base = &version;
+    iov.iov_len = sizeof(version);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+    ssize_t n = recvmsg(master, &msg, 0);
+    if (n != (ssize_t)sizeof(version)) {
+        snprintf(out, outlen, "proto=recvmsg-failed(%zd:%s)", n, strerror(errno));
+        return;
+    }
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)
+            reqfd = *(int *)CMSG_DATA(c);
+    if (reqfd < 0) {
+        snprintf(out, outlen, "proto=no-request-fd");
+        return;
+    }
+    if (version != HUSK_SERVER_PROTOCOL_VERSION) {
+        snprintf(out, outlen, "proto=version-mismatch(got %u want %d)",
+                 version, HUSK_SERVER_PROTOCOL_VERSION);
+        goto done;
+    }
+
+    if (pipe(reply_pipe) || pipe(wait_pipe)) {
+        snprintf(out, outlen, "proto=pipe-failed(%s)", strerror(errno));
+        goto done;
+    }
+
+    /* client -> server: 8-byte struct send_fd (tid=0 selects the process's
+     * first thread) + SCM_RIGHTS. data.fd is the CLIENT fd number; the server
+     * records it as the inflight key, which is what req->reply_fd refers to. */
+    for (int k = 0; k < 2; k++) {
+        int fd = k ? wait_pipe[1] : reply_pipe[1];
+        struct husk_send_fd data;
+        data.tid = 0;
+        data.fd = fd;
+        char cb[CMSG_SPACE(sizeof(int))];
+        struct iovec v;
+        struct msghdr m;
+        memset(&m, 0, sizeof(m));
+        v.iov_base = &data;
+        v.iov_len = sizeof(data);
+        m.msg_iov = &v;
+        m.msg_iovlen = 1;
+        m.msg_control = cb;
+        m.msg_controllen = sizeof(cb);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        *(int *)CMSG_DATA(c) = fd;
+        m.msg_controllen = c->cmsg_len;
+        if (sendmsg(master, &m, 0) != (ssize_t)sizeof(data)) {
+            snprintf(out, outlen, "proto=sendmsg-failed(%s)", strerror(errno));
+            goto done;
+        }
+    }
+
+    unsigned char req[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
+    struct husk_init_first_thread_request *r =
+        (struct husk_init_first_thread_request *)req;
+    r->h.req = HUSK_REQ_INIT_FIRST_THREAD;
+    r->h.request_size = 0;   /* no variable-sized request data */
+    r->h.reply_size = 0;     /* no variable-sized reply data expected */
+    r->unix_pid = (int)getpid();
+    r->unix_tid = 0;
+    r->debug_level = 0;
+    r->reply_fd = reply_pipe[1];
+    r->wait_fd = wait_pipe[1];
+    if (write(reqfd, req, sizeof(req)) != (ssize_t)sizeof(req)) {
+        snprintf(out, outlen, "proto=write-failed(%s)", strerror(errno));
+        goto done;
+    }
+
+    struct pollfd pfd;
+    pfd.fd = reply_pipe[0];
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, 3000);
+    if (pr <= 0) {
+        snprintf(out, outlen, "proto=reply-timeout(poll=%d:%s)", pr,
+                 pr < 0 ? strerror(errno) : "no data");
+        goto done;
+    }
+    unsigned char rep[HUSK_GENERIC_REQUEST_SIZE] = { 0 };
+    ssize_t rn = read(reply_pipe[0], rep, sizeof(rep));
+    if (rn < (ssize_t)sizeof(struct husk_reply_prefix)) {
+        snprintf(out, outlen, "proto=short-reply(%zd)", rn);
+        goto done;
+    }
+    struct husk_reply_prefix *rp = (struct husk_reply_prefix *)rep;
+    snprintf(out, outlen, "proto=ok ver=%u error=0x%08x pid=%u tid=%u",
+             version, rp->error, rp->pid, rp->tid);
+
+done:
+    if (reqfd >= 0) close(reqfd);
+    for (int k = 0; k < 2; k++) {
+        if (reply_pipe[k] >= 0) close(reply_pipe[k]);
+        if (wait_pipe[k] >= 0) close(wait_pipe[k]);
+    }
 }
 
 int32_t husk_wine_probe(void)
@@ -220,7 +374,8 @@ int32_t husk_wine_probe(void)
         }
 
         const char *sock_path = found.fileSystemRepresentation;
-        int ce = connect_unix(sock_path);
+        int master = -1;
+        int ce = connect_unix(sock_path, &master);
         if (ce != 0) {
             set_error("socket %s refused: %s (path %lu chars, wineserver %s, %s)",
                       found.lastPathComponent.UTF8String, strerror(ce),
@@ -235,19 +390,30 @@ int32_t husk_wine_probe(void)
         usleep(1500 * 1000);
         waited = now_ms() - t0;
         if (g_ws_returned != 0) {
+            close(master);
             set_error("wineserver %s after connect (rc=%d, %s)",
                       g_ws_returned == 2 ? "thread exited early" : "returned",
                       g_ws_result, nls_state);
             return -4;
         }
         if (![fm fileExistsAtPath:found]) {
+            close(master);
             set_error("socket disappeared after connect (%s)", nls_state);
             return -4;
         }
 
-        set_error("ok in %.0fms, socket %s (%lu chars), wineserver %s, %s",
+        /* M2: on the very same connection, drive a real Wine server request.
+         * This is an add-on diagnostic -- its outcome is appended to the
+         * result line, never used to fail the already-proven A route. */
+        char proto[256] = "proto=skipped";
+        husk_protocol_probe(master, proto, sizeof(proto));
+        close(master);
+        const char *ws_after = g_ws_returned == 0 ? "alive" : "died";
+
+        set_error("ok in %.0fms, socket %s (%lu chars), wineserver %s, %s, %s, ws_after_proto=%s",
                   waited, found.lastPathComponent.UTF8String,
-                  (unsigned long)strlen(sock_path), ws_state, nls_state);
+                  (unsigned long)strlen(sock_path), ws_state, nls_state,
+                  proto, ws_after);
         return 0;
     }
 }

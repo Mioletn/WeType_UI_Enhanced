@@ -85,6 +85,32 @@ if [ ! -f "$BUILD/include/config.h" ]; then
     exit 0
 fi
 
+# M2: WineProbe.mm mirrors a few wire constants from server_protocol.h. Verify
+# them against the checked-out fork so a protocol bump fails the build instead
+# of silently producing a probe that lies on-device.
+PROTO="$SRC/include/wine/server_protocol.h"
+if [ -f "$PROTO" ] && command -v python3 >/dev/null 2>&1; then
+    if ! python3 - "$PROTO" <<'PY'
+import re, sys
+t = open(sys.argv[1]).read()
+ver = int(re.search(r"#define SERVER_PROTOCOL_VERSION\s+(\d+)", t).group(1))
+enum = t[t.index("enum request"):]
+enum = enum[:enum.index("};")]
+names = re.findall(r"^\s*(REQ_\w+)", enum, re.M)
+idx = names.index("REQ_init_first_thread")
+pad = int(re.search(r"struct request_max_size\s*\{\s*int\s+pad\[(\d+)\]", t, re.S).group(1))
+print("==> M2 protocol: version=%d REQ_init_first_thread=%d generic_request=%d"
+      % (ver, idx, pad * 4))
+assert ver == 930 and idx == 5 and pad * 4 == 64, \
+    "WineProbe.mm M2 constants drifted from server_protocol.h"
+PY
+    then
+        echo "M2 protocol constants drifted -- update WineProbe.mm before building" \
+            | tee -a "$OUT/ntdll-summary.txt"
+        exit 1
+    fi
+fi
+
 CFLAGS=(
     -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$MIN"
     -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing

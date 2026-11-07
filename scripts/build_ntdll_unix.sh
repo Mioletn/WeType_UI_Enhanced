@@ -206,7 +206,7 @@ if [ -f "$BUILD/include/config.h" ]; then
                 -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\" \
                 -I"$BUILD/include" -I"$SRC/include" -I"$SRC/include/wine" \
                 -I"$BUILD" -I"$SRC/server" -I"$SHIMS/shims" -I"$SHIMS" \
-                -D__WINESRC__ -DWINE_IOS=1 \
+                -D__WINESRC__ \
                 $EXTRA \
                 -c "$src" -o "$OBJ/ws-$n.o" 2> "$OUT/ws-$n.err"; then
                 WS_OK=$((WS_OK + 1)); echo "OK   $n" >> "$OUT/wineserver-summary.txt"

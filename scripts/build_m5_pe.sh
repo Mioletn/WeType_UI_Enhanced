@@ -177,17 +177,39 @@ for p in glob.glob(os.path.join(root, "*.c")):
         print("  patched", os.path.basename(p))
 print("  total patched files:", n)
 PY
+        # Round 4's only hard error: unix/system.c calls ios_avail_phys(),
+        # implemented in virtual_ios.c, an iOS-only TU the x86_64 host build
+        # never compiles. ntdll.so fails to link on that ONE private symbol.
+        # The PE DLL never uses unix-side code, so stub the call on the host.
+        log "stubbing ios_avail_phys for the host unix side ..."
+        python3 - "$SRC/dlls/ntdll/unix/system.c" <<'PY' | tee -a "$REPORT"
+import re, sys
+p = sys.argv[1]
+try:
+    src = open(p, encoding="utf-8", errors="replace").read()
+except OSError as e:
+    print("  system.c unavailable:", e); raise SystemExit(0)
+pat = re.compile(r'\bfreeram\s*=\s*ios_avail_phys\s*\([^;]*\)\s*;')
+out, n = pat.subn("/* Husk host build: ios_avail_phys is iOS-only */", src)
+if n:
+    open(p, "w", encoding="utf-8").write(out)
+    print("  patched system.c: %d ios_avail_phys call(s) removed" % n)
+else:
+    print("  system.c: ios_avail_phys call not found (source may differ)")
+PY
         log ""
         log "== ntdll Makefile targets (first 25) =="
         grep -E '^[a-zA-Z0-9_.$/-]+:' "$PE/dlls/ntdll/Makefile" 2>/dev/null \
             | head -25 | sed 's/^/  /' | tee -a "$REPORT"
         log ""
 
-        # Round 3: the full build had ZERO compile errors and was already
-        # emitting ntdll.dll's version resources at 75% of the log -- it was
-        # cut off only by the 15 min cap. Give it a full hour this time.
-        log "make -j4 full Wine build (60 min cap) ..."
-        python3 - 3600 "$OUT/wine-pe-make.log" "$PE" make -j4 <<'PY'
+        # Round 4 proved the toolchain compiles everything with ZERO "error:"
+        # lines; it only stopped at the unix-side ntdll.so link (one private
+        # iOS symbol, now stubbed above). -k is the second safety net: even if
+        # another host-only link fails, make keeps going and still emits the
+        # PE DLLs we actually came for. 60 min cap, workflow limit 90 min.
+        log "make -k -j4 full Wine build (60 min cap) ..."
+        python3 - 3600 "$OUT/wine-pe-make.log" "$PE" make -k -j4 <<'PY'
 import subprocess, sys
 secs, logf, cwd = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 cmd = sys.argv[4:]
@@ -212,7 +234,7 @@ fi
 
 log ""
 log "== ntdll.dll artifacts found =="
-find "$SRC" -name "ntdll.dll" -type f 2>/dev/null | while read -r f; do
+find "$SRC" "$PE" -name "ntdll.dll" -type f 2>/dev/null | sort -u | while read -r f; do
     log "  $f ($(wc -c < "$f") bytes)"
     cp "$f" "$OUT/ntdll.dll" 2>/dev/null && log "  copied to build/m1/pe/ntdll.dll"
 done

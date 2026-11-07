@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unistd.h>
 
 #ifdef HUSK_SAVED_DEBUG
 #define DEBUG HUSK_SAVED_DEBUG
@@ -77,6 +78,15 @@ static void set_err(const char *fmt, ...) {
     vsnprintf(g_err, sizeof(g_err), fmt, ap);
     va_end(ap);
     fprintf(stderr, "[husk-fex] %s\n", g_err);
+}
+
+// Unbuffered progress trace. fprintf() output can be lost when the process
+// dies from SIGBUS mid-JIT, which is exactly the failure mode M5 is chasing.
+static void husk_pe_trace(const char *label, uint64_t a, uint64_t b) {
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf), "[husk-pe] %s a=0x%llx b=0x%llx\n",
+                     label, (unsigned long long)a, (unsigned long long)b);
+    if (n > 0) (void)::write(2, buf, static_cast<size_t>(n));
 }
 
 static HuskDualMapping g_map{};
@@ -169,15 +179,16 @@ static void fex_throw_handler(const char *msg) {
 }
 
 // ---------------------------------------------------------------------------
-// Probe
+// One-time FEXCore setup, shared by the M0 self-check and the M5 PE probe.
+//
+// M5 finding (2026-11-07): creating a SECOND guest thread on an already used
+// Context is fatal on iOS 12.2. The second JIT code buffer's last page fails
+// mprotect and the app dies with SIGBUS right after [TI-IC] jitcore-done;
+// isolating the wineserver probe did not change it. Therefore exactly ONE
+// guest program may run per app launch, and the two probes are gated by
+// separate marker files (see LegacyRootViewController.swift).
 // ---------------------------------------------------------------------------
-int64_t husk_fex_probe(void) {
-    if (g_ready.load(std::memory_order_acquire)) return 0; // already ran
-    if (g_cached.load() != -999) return g_cached.load();
-
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (g_cached.load() != -999) return g_cached.load();
-
+static int64_t husk_fex_init(void) {
     // 1. dual-mapped JIT region from Husk's allocator. husk_ios_jit_allocate
     //    hands back the prewarmed region when it is big enough, otherwise it
     //    allocates one; the probe runs before QEMU, so this is the allocate path.
@@ -246,6 +257,21 @@ int64_t husk_fex_probe(void) {
     g_ctx->SetHardwareTSOSupport(true);
 
     if (!g_ctx->InitCore()) { set_err("InitCore failed"); g_cached.store(-4); return -4; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// M0 probe: the 53-byte FEXCore self-check (exit=42).
+// ---------------------------------------------------------------------------
+int64_t husk_fex_probe(void) {
+    if (g_ready.load(std::memory_order_acquire)) return 0; // already ran
+    if (g_cached.load() != -999) return g_cached.load();
+
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (g_cached.load() != -999) return g_cached.load();
+
+    const int64_t initrc = husk_fex_init();
+    if (initrc != 0) { g_cached.store(initrc); return initrc; }
 
     // 5. guest code: a 53-byte self-checking program, hand-assembled from
     //    probe/probe.s in the workspace:
@@ -411,15 +437,21 @@ static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
 }
 
 static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
-    // The Swift call site runs this right after husk_fex_probe(), but keep it
-    // self-contained so a standalone PE marker also works.
+    // A launch runs exactly ONE guest program. The PE marker does not run the
+    // M0 self-check, so initialise the Context here WITHOUT creating that
+    // first guest thread. Calling husk_fex_probe() here would create two
+    // threads and crash on iOS 12.2 (SIGBUS in the second JIT code buffer).
     if (!g_ctx) {
-        const int64_t warm = husk_fex_probe();
-        if (warm != 42 || !g_ctx) {
-            set_err("PE: FEXCore not ready (warm=%lld)", (long long)warm);
-            return -20;
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (!g_ctx) {
+            const int64_t initrc = husk_fex_init();
+            if (initrc != 0 || !g_ctx) {
+                set_err("PE: FEXCore init failed (rc=%lld)", (long long)initrc);
+                return -20;
+            }
         }
     }
+    husk_pe_trace("context-ready", 0, 0);
 
     HuskPEHeader pe{};
     if (!husk_parse_pe32plus(file, file_size, &pe)) return -21;
@@ -466,6 +498,7 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
     const uint64_t image_addr = reinterpret_cast<uint64_t>(image);
     g_code_base = image_addr;   // QueryGuestExecutableRange must cover the PE
     g_code_size = map_size;
+    husk_pe_trace("mapped", image_addr, map_size);
 
     constexpr size_t STACK_SIZE = 0x10000;
     void *stack = ::mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE,
@@ -484,7 +517,9 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
     *(--sp) = 0; // argc
     const uint64_t start_sp = reinterpret_cast<uint64_t>(sp);
 
+    husk_pe_trace("before-create", image_addr + stub_rva, start_sp);
     auto *thread = g_ctx->CreateThread(image_addr + stub_rva, start_sp);
+    husk_pe_trace("after-create", reinterpret_cast<uint64_t>(thread), 0);
     if (!thread) {
         set_err("PE: CreateThread null");
         ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
@@ -514,12 +549,14 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
     }
 
     g_exit_code = -99;
+    husk_pe_trace("before-exec", image_addr + stub_rva, 0);
     if (setjmp(g_exit_jmp) == 0) {
         g_ctx->ExecuteThread(thread);
         set_err("PE: ExecuteThread returned without exit");
         g_exit_code = -9;
     }
     const int64_t rc = g_exit_code;
+    husk_pe_trace("guest-exit", static_cast<uint64_t>(rc), 0);
     fprintf(stderr,
             "[husk-pe] image=%p map=0x%zx sections=%u entry=0x%x stub=0x%zx exit=%lld\n",
             image, map_size, (unsigned)pe.section_count, pe.entry_rva,

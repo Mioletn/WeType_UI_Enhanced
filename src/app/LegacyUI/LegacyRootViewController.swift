@@ -35,21 +35,15 @@ final class LegacyRootViewController: UITabBarController {
         // result to Documents/husk-fex-probe.log for collection over SSH.
         let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0]
         let probeMarker = (docs as NSString).appendingPathComponent("husk-fex-probe")
-        if FileManager.default.fileExists(atPath: probeMarker) {
+        let peMarker = (docs as NSString).appendingPathComponent("husk-pe-probe")
+        // Only ONE FEXCore guest program may run per launch: a second guest
+        // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
+        // The PE marker therefore takes precedence and suppresses the M0
+        // self-check; use husk-fex-probe on its own to regression-test M0.
+        if FileManager.default.fileExists(atPath: peMarker) {
             DispatchQueue.global(qos: .userInitiated).async {
-                let rc = husk_fex_probe()
-                var msg = "husk-fex-probe: exit=\(rc)"
-                if rc != 42, let e = husk_fex_last_error() {
-                    msg += " err=\(String(cString: e))"
-                }
-                HuskLog.log("fex", msg)
-                let logPath = (docs as NSString).appendingPathComponent("husk-fex-probe.log")
-                try? (msg + "\n").write(toFile: logPath, atomically: true, encoding: .utf8)
-
-                // M5: the first Windows PE. Runs on this same queue right after
-                // the FEXCore self-check, so the JIT context is already warm and
-                // no two threads race to initialise it. hello.exe is a
-                // freestanding PE32+ whose entry returns 42 through a stubbed
+                // M5: freestanding PE32+ mapped and executed as the launch's
+                // only guest program. Its entry returns 42 through a stubbed
                 // exit(60) syscall; see FEXBridge.mm.
                 let peRc = husk_pe_probe()
                 var peMsg = "husk-pe-probe: rc=\(peRc)"
@@ -59,6 +53,17 @@ final class LegacyRootViewController: UITabBarController {
                 HuskLog.log("pe", peMsg)
                 let peLog = (docs as NSString).appendingPathComponent("husk-pe-probe.log")
                 try? (peMsg + "\n").write(toFile: peLog, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: probeMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let rc = husk_fex_probe()
+                var msg = "husk-fex-probe: exit=\(rc)"
+                if rc != 42, let e = husk_fex_last_error() {
+                    msg += " err=\(String(cString: e))"
+                }
+                HuskLog.log("fex", msg)
+                let logPath = (docs as NSString).appendingPathComponent("husk-fex-probe.log")
+                try? (msg + "\n").write(toFile: logPath, atomically: true, encoding: .utf8)
             }
         }
 

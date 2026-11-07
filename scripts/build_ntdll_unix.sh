@@ -208,10 +208,31 @@ if [ -f "$BUILD/include/config.h" ]; then
                 # the app's Documents, which is writable. Force just that one
                 # #ifdef for this TU: defining __ANDROID__ (or WINE_IOS) for all
                 # server/*.c changes other TUs and pulls Madeira-private symbols.
+                #
+                # fatal_error() also lives in this TU, and its exit(1) takes the
+                # entire app down when anything inside wineserver goes wrong.
+                # Husk starts wineserver on a thread, so end only that thread:
+                # the app stays alive and the Wine probe can write its log.
                 # The .tmp extension keeps it out of the *.c loop above.
-                sed 's|^#ifdef __ANDROID__.*$|#if 1  /* Husk: iOS has no writable /tmp */|' \
+                sed -e 's|^#ifdef __ANDROID__.*$|#if 1  /* Husk: iOS has no writable /tmp */|' \
+                    -e '/void fatal_error/,/^}/ s|^    exit(1);$|    pthread_exit(NULL);  /* Husk: do not kill the app */|' \
                     "$src" > "$SRC/server/husk_request.tmp"
                 WS_SRC="$SRC/server/husk_request.tmp"
+                EXTRA="-x c -include pthread.h"
+            elif [ "$n" = mach ]; then
+                # Wine's macOS tracing branch registers the wineserver with
+                # launchd through bootstrap_register2(). An iOS app has no
+                # launchd access, so on-device this fails with
+                #   wineserver: Can't check in server_mach_port
+                # and fatal_error() kills the app. Madeira's WINE_IOS mach.c
+                # skips the check-in entirely; do the same here, but keep the
+                # allocated port (init_process_tracing() receives on it with a
+                # zero timeout). Defining WINE_IOS globally is not an option:
+                # it pulls the Madeira-private ios_* symbols back into the link.
+                sed -e 's|if (bootstrap_register2( bp, server_dir, server_mach_port, 0 ) != KERN_SUCCESS)|if (0)  /* Husk: no launchd on iOS */|' \
+                    -e 's|    assert(0);  /\* should never be called on MacOS \*/|    return;  /* Husk: iOS wineserver has no children */|' \
+                    "$src" > "$SRC/server/husk_mach.tmp"
+                WS_SRC="$SRC/server/husk_mach.tmp"
                 EXTRA="-x c"
             fi
             if xcrun --sdk iphoneos clang \

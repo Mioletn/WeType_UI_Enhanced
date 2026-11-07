@@ -54,6 +54,15 @@ static double now_ms(void)
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+/* fatal_error() in the Husk build ends the wineserver thread with
+ * pthread_exit() instead of exit(1). Cleanup handlers still run on
+ * pthread_exit, so this lets the probe distinguish "the server thread died
+ * early" (2) from "it returned normally" (1) and "still starting" (0). */
+static void ws_thread_cleanup(void *unused)
+{
+    g_ws_returned = 2;
+}
+
 static void *wineserver_thread(void *unused)
 {
     /* -f stays in the foreground (do not fork), -p persists, -d suppresses the
@@ -61,7 +70,9 @@ static void *wineserver_thread(void *unused)
     static char a0[] = "wineserver", a1[] = "-f", a2[] = "-p", a3[] = "-d";
     char *argv[] = { a0, a1, a2, a3, NULL };
 
+    pthread_cleanup_push(ws_thread_cleanup, NULL);
     g_ws_result = wineserver_main(4, argv);
+    pthread_cleanup_pop(0);
     g_ws_returned = 1;
     return NULL;
 }
@@ -174,25 +185,28 @@ int32_t husk_wine_probe(void)
         }
 
         double waited = now_ms() - t0;
+        const char *ws_state = g_ws_returned == 2 ? "thread exited early (fatal_error)"
+                             : g_ws_returned == 1 ? "returned"
+                             : "still starting";
 
         if (!found) {
-            set_error("no socket after %.0fms in %s (wineserver returned=%d rc=%d)",
-                      waited, prefix.UTF8String, g_ws_returned, g_ws_result);
+            set_error("no socket after %.0fms in %s (wineserver %s rc=%d)",
+                      waited, prefix.UTF8String, ws_state, g_ws_result);
             return -2;
         }
 
         const char *sock_path = found.fileSystemRepresentation;
         int ce = connect_unix(sock_path);
         if (ce != 0) {
-            set_error("socket %s refused: %s (path %lu chars)",
+            set_error("socket %s refused: %s (path %lu chars, wineserver %s)",
                       found.lastPathComponent.UTF8String, strerror(ce),
-                      (unsigned long)strlen(sock_path));
+                      (unsigned long)strlen(sock_path), ws_state);
             return -3;
         }
 
-        set_error("ok in %.0fms, socket %s (%lu chars), wineserver returned=%d",
+        set_error("ok in %.0fms, socket %s (%lu chars), wineserver %s",
                   waited, found.lastPathComponent.UTF8String,
-                  (unsigned long)strlen(sock_path), g_ws_returned);
+                  (unsigned long)strlen(sock_path), ws_state);
         return 0;
     }
 }

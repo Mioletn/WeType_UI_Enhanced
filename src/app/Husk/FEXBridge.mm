@@ -527,15 +527,31 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
     }
     {
         constexpr size_t CR = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-        void *a = ::mmap(nullptr, CR + 2 * PAGE, PROT_NONE,
+        // iOS arm64 uses 16 KiB pages (sysctl hw.pagesize = 16384). mprotect()
+        // requires a page-aligned start, so the guard offset MUST be 0x4000 --
+        // the M0 probe already does this. Using PAGE=0x1000 here left crbase
+        // unaligned: mprotect silently failed, the shadow call/ret stack stayed
+        // PROT_NONE, and the PE stub's `call` faulted while pushing its return
+        // address (SIGBUS, swallowed by the trap guard, hence no .ips report).
+        constexpr size_t PG = 0x4000;
+        void *a = ::mmap(nullptr, CR + 2 * PG, PROT_NONE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (a == MAP_FAILED) {
             set_err("PE: callret mmap failed");
             ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
             return -27;
         }
-        void *crbase = static_cast<uint8_t *>(a) + PAGE;
-        ::mprotect(crbase, CR, PROT_READ | PROT_WRITE);
+        void *crbase = static_cast<uint8_t *>(a) + PG;
+        if (::mprotect(crbase, CR, PROT_READ | PROT_WRITE) != 0) {
+            set_err("PE: callret mprotect failed (crbase=%p CR=0x%zx PG=0x%zx)",
+                    crbase, CR, PG);
+            ::munmap(a, CR + 2 * PG);
+            ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
+            return -28;
+        }
+        // Prove the region is writable before the JIT ever touches it.
+        *reinterpret_cast<volatile uint8_t *>(crbase) = 0;
+        husk_pe_trace("callret-writable", reinterpret_cast<uint64_t>(crbase), CR);
         thread->CallRetStackBase = crbase;
         thread->CurrentFrame->State.callret_sp =
             reinterpret_cast<uint64_t>(crbase) + CR / 4;

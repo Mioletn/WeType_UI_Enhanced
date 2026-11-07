@@ -1,0 +1,36 @@
+# M5 spike: produce Windows PE binaries without paying for a full IPA build.
+# Separate branch/pool from build-ipa and m1-wine so an iteration costs minutes.
+name: m5-pe
+
+on:
+  push:
+    branches: [m5-pe]
+  workflow_dispatch:
+
+jobs:
+  pe:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app || xcode-select -p
+          xcodebuild -version
+
+      - name: PE cross toolchain
+        run: |
+          brew install bison mingw-w64 pkg-config
+          command -v x86_64-w64-mingw32-gcc || true
+
+      - name: "M5: produce hello PE and probe Wine PE build"
+        run: ./scripts/build_m5_pe.sh
+
+      - name: Upload PE artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m5-pe
+          path: build/m1/pe/**
+          if-no-files-found: warn

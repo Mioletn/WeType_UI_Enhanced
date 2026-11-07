@@ -234,7 +234,11 @@ fi
 if [ -f "$LIBDIR/libntdll_unix.a" ] && [ -f "$LIBDIR/libwineserver_unix.a" ]; then
     echo ""
     echo "==> link probe (ntdll_unix + wineserver_unix)"
-    printf 'int wineserver_main(int, char **);\nint husk_link_probe(void){ return 0; }\n' \
+    # Call wineserver_main for real: the object chain pulled in then matches the
+    # app's exactly. Without this the probe pulls nothing, and with -all_load it
+    # pulls ntdll's virtual.o too, which needs the optional unixlib tables the
+    # app never references -- noise that hides the real gap.
+    printf 'int wineserver_main(int, char **);\nint husk_link_probe(void){ static char a[] = "wineserver"; char *v[2]; v[0] = a; v[1] = 0; return wineserver_main( 1, v ); }\n' \
         > "$OBJ/linkprobe.c"
     if xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min="$MIN" -c "$OBJ/linkprobe.c" -o "$OBJ/linkprobe.o" \
@@ -243,7 +247,7 @@ if [ -f "$LIBDIR/libntdll_unix.a" ] && [ -f "$LIBDIR/libwineserver_unix.a" ]; th
             -miphoneos-version-min="$MIN" -dynamiclib -Wl,-undefined,error \
             -o "$OUT/libhusk-wine-probe.dylib" "$OBJ/linkprobe.o" \
             "$LIBDIR/libntdll_unix.a" "$LIBDIR/libwineserver_unix.a" \
-            -framework CoreFoundation -framework Security \
+            -framework CoreFoundation -framework Security -framework IOKit \
             2> "$OUT/link.log"; then
         echo "    link OK"
     else

@@ -1,0 +1,37 @@
+# M1 gate: Wine unix side vs iOS 12.2. Report-only, separate from build-ipa so
+# an iteration costs minutes of compile instead of a full IPA rebuild.
+name: m1-wine
+
+on:
+  push:
+    branches: [m1-wine]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    # Intel, not arm64: the capacity annotation on build-ipa names "macOS arm64
+    # runners" specifically, and this is only a compile probe -- an Intel host
+    # cross-compiles arm64 iOS just as well. Different pool, different queue.
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app || xcode-select -p
+          xcodebuild -version
+
+      - name: Build dependencies
+        run: brew install bison mingw-w64 pkg-config
+
+      - name: Compile dlls/ntdll/unix at min 12.0
+        run: ./scripts/build_ntdll_unix.sh
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-wine-logs
+          path: build/m1/**
+          if-no-files-found: warn

@@ -1,0 +1,30 @@
+# Which macOS image can this account actually get? Two five-minute jobs, one
+# per image. If both queue forever, it is an account/quota block; if one runs,
+# it is capacity on the other image and build-ipa can simply move.
+name: ping-macos
+
+on:
+  push:
+    branches: [m1-wine]
+  workflow_dispatch:
+
+jobs:
+  macos14:
+    runs-on: macos-14
+    timeout-minutes: 6
+    steps:
+      - name: runner is alive
+        run: |
+          uname -a
+          xcodebuild -version || true
+          ls /Applications | grep -i '^Xcode' || true
+
+  macos15:
+    runs-on: macos-15
+    timeout-minutes: 6
+    steps:
+      - name: runner is alive
+        run: |
+          uname -a
+          xcodebuild -version || true
+          ls /Applications | grep -i '^Xcode' || true

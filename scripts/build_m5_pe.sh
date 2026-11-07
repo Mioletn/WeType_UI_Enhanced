@@ -110,7 +110,24 @@ COMMON="--without-x --disable-tests --without-freetype --without-gnutls
         --without-pcap --without-usb --without-wayland"
 
 if [ -f "$SRC/configure" ]; then
+    # Madeira's unix TUs include "../../../../build/madeira_cfg.h", a header
+    # generated outside the source tree by their build. config.status/makedep
+    # fails on sync.c:29 without it (first spike died exactly there). The file
+    # is header-only and already vendored in wine-ios/ntdll; place copies at
+    # every plausible root so the relative include resolves.
+    CFG="$ROOT/wine-ios/ntdll/madeira_cfg.h"
+    if [ -f "$CFG" ]; then
+        WINE_TOP="$(dirname "$SRC")"
+        for d in "$WINE_TOP/build" "$SRC/build"; do
+            mkdir -p "$d" && cp "$CFG" "$d/madeira_cfg.h" \
+                && log "placed madeira_cfg.h -> $d"
+        done
+    else
+        log "WARNING: wine-ios/ntdll/madeira_cfg.h not found"
+    fi
+
     rm -rf "$PE"; mkdir -p "$PE"
+    mkdir -p "$PE/build" && [ -f "$CFG" ] && cp "$CFG" "$PE/build/madeira_cfg.h"
     log "configure --enable-archs=x86_64 ..."
     python3 - 1800 "$OUT/wine-pe-configure.log" "$PE" "$SRC/configure" \
         --enable-archs=x86_64 $COMMON <<'PY'
@@ -134,8 +151,8 @@ PY
             "$OUT/wine-pe-configure.log" | sed 's/^/    /' | tee -a "$REPORT"
     fi
     if [ -f "$PE/Makefile" ]; then
-        log "make -j4 (25 min cap) ..."
-        python3 - 1500 "$OUT/wine-pe-make.log" "$PE" make -j4 <<'PY'
+        log "make -j4 (35 min cap) ..."
+        python3 - 2100 "$OUT/wine-pe-make.log" "$PE" make -j4 <<'PY'
 import subprocess, sys
 secs, logf, cwd = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 cmd = sys.argv[4:]
@@ -144,7 +161,7 @@ with open(logf, "w") as f:
         rc = subprocess.call(cmd, cwd=cwd, stdout=f,
                              stderr=subprocess.STDOUT, timeout=secs)
     except subprocess.TimeoutExpired:
-        f.write("\nTIMEOUT (25 min cap)\n"); rc = 124
+        f.write("\nTIMEOUT (35 min cap)\n"); rc = 124
     f.write("\nMAKE_RC=%d\n" % rc)
 PY
         grep -E "MAKE_RC=|TIMEOUT" "$OUT/wine-pe-make.log" | tee -a "$REPORT"
@@ -156,7 +173,7 @@ fi
 
 log ""
 log "== ntdll.dll artifacts found =="
-find "$PE" -name "ntdll.dll" -type f 2>/dev/null | while read -r f; do
+find "$SRC" -name "ntdll.dll" -type f 2>/dev/null | while read -r f; do
     log "  $f ($(wc -c < "$f") bytes)"
     cp "$f" "$OUT/ntdll.dll" 2>/dev/null && log "  copied to build/m1/pe/ntdll.dll"
 done

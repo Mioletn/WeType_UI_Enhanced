@@ -77,7 +77,18 @@ cp "$DD/build.log" "$HUSK_ROOT/build/logs/xcodebuild.log" 2>/dev/null || true
 if ! grep -q "BUILD SUCCEEDED" "$DD/build.log"; then
     echo "build failed; refusing to package a stale app" >&2
     echo "  $(grep -c 'error:' "$DD/build.log" || true) error line(s), first 40:" >&2
-    grep -E "error:" "$DD/build.log" | head -40 >&2
+    grep -E "error:" "$DD/build.log" | head -40 >&2 || true
+    # ld does not put "error:" in its own diagnostics: an archive/framework link
+    # failure shows up as "Undefined symbols for architecture arm64:", a list of
+    # "_sym", referenced from: lines, and "ld: symbol(s) not found". Without the
+    # block below the job log contains only "clang++: error: linker command
+    # failed", which hides every missing symbol -- as it did for three Wine
+    # builds in a row. set -euo pipefail is on, hence the || true guards.
+    echo "  linker diagnostics:" >&2
+    grep -A 60 -E "Undefined symbols for architecture|duplicate symbol" \
+        "$DD/build.log" | head -80 >&2 || true
+    grep -E "^ld: |symbol\(s\) not found|^clang: error|Undefined symbols" \
+        "$DD/build.log" | head -20 >&2 || true
     exit 1
 fi
 

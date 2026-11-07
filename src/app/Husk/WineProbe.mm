@@ -14,6 +14,8 @@
 #import <Foundation/Foundation.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -72,10 +74,32 @@ static int connect_unix(const char *path)
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, path, sizeof(sa.sun_path) - 1);
+
+    /* An iOS container path is ~150 chars, longer than sockaddr_un.sun_path
+     * (104). wineserver chdir()s into its server directory and binds the
+     * relative name "socket" (server/request.c), so connect the same way:
+     * chdir into the socket's directory, use just the basename, then restore
+     * the previous directory with fchdir. strncpy-ing the absolute path used
+     * to silently truncate it and fail with ENOENT. */
+    int saved = open(".", O_RDONLY);
+    int relative = 0;
+    const char *slash = strrchr(path, '/');
+    if (slash && (size_t)(slash - path) < PATH_MAX) {
+        char dir[PATH_MAX];
+        size_t len = (size_t)(slash - path);
+        memcpy(dir, path, len);
+        dir[len] = 0;
+        if (chdir(dir) == 0) {
+            strncpy(sa.sun_path, slash + 1, sizeof(sa.sun_path) - 1);
+            relative = 1;
+        }
+    }
+    if (!relative) strncpy(sa.sun_path, path, sizeof(sa.sun_path) - 1);
 
     int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
     int e = rc == 0 ? 0 : errno;
+    if (relative && saved >= 0) fchdir(saved);
+    if (saved >= 0) close(saved);
     close(fd);
     return e;
 }
@@ -117,7 +141,12 @@ int32_t husk_wine_probe(void)
 
         /* wineserver reads both; WINEPREFIX decides where the socket goes and
          * TMPDIR is the fallback when it cannot use the prefix. */
+        NSString *tmp = NSTemporaryDirectory();
         setenv("WINEPREFIX", prefix.fileSystemRepresentation, 1);
+        /* wineserver's server/request.c now uses $WINEPREFIX/.wineserver on
+         * iOS; TMPDIR is set too so any Wine code that falls back to getenv
+         * lands in the app's own tmp, not the sandbox-denied /tmp. */
+        if (tmp) setenv("TMPDIR", tmp.fileSystemRepresentation, 1);
         setenv("WINEDEBUG", "-all", 1);
         setenv("WINEDLLOVERRIDES", "winemenubuilder.exe,mscoree,mshtml=", 1);
 
@@ -137,8 +166,7 @@ int32_t husk_wine_probe(void)
         pthread_detach(th);
 
         NSString *found = nil;
-        NSString *tmp = NSTemporaryDirectory();
-        for (int i = 0; i < 60 && !found; i++) {
+        for (int i = 0; i < 100 && !found; i++) {
             usleep(100 * 1000);
             found = find_socket(prefix, 4);
             if (!found && tmp) found = find_socket(tmp, 3);
@@ -148,19 +176,23 @@ int32_t husk_wine_probe(void)
         double waited = now_ms() - t0;
 
         if (!found) {
-            set_error("no socket after %.0fms (wineserver returned=%d rc=%d)",
-                      waited, g_ws_returned, g_ws_result);
+            set_error("no socket after %.0fms in %s (wineserver returned=%d rc=%d)",
+                      waited, prefix.UTF8String, g_ws_returned, g_ws_result);
             return -2;
         }
 
-        int ce = connect_unix(found.fileSystemRepresentation);
+        const char *sock_path = found.fileSystemRepresentation;
+        int ce = connect_unix(sock_path);
         if (ce != 0) {
-            set_error("socket %s refused: %s", found.lastPathComponent.UTF8String, strerror(ce));
+            set_error("socket %s refused: %s (path %lu chars)",
+                      found.lastPathComponent.UTF8String, strerror(ce),
+                      (unsigned long)strlen(sock_path));
             return -3;
         }
 
-        set_error("ok in %.0fms, socket %s, wineserver returned=%d",
-                  waited, found.lastPathComponent.UTF8String, g_ws_returned);
+        set_error("ok in %.0fms, socket %s (%lu chars), wineserver returned=%d",
+                  waited, found.lastPathComponent.UTF8String,
+                  (unsigned long)strlen(sock_path), g_ws_returned);
         return 0;
     }
 }

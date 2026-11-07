@@ -192,10 +192,28 @@ if [ -f "$BUILD/include/config.h" ]; then
         : > "$OUT/wineserver-summary.txt"
         for src in "$SRC"/server/*.c; do
             n="$(basename "$src" .c)"
+            WS_SRC="$src"
             # server/main.c defines main(); rename it so the app can start
             # wineserver on its own thread instead of a process.
             EXTRA=""
-            [ "$n" = main ] && EXTRA="-Dmain=wineserver_main"
+            if [ "$n" = main ]; then
+                EXTRA="-Dmain=wineserver_main"
+            elif [ "$n" = request ]; then
+                # server/request.c puts the server directory in /tmp/.wine-<uid>
+                # unless __ANDROID__ is defined. On iOS the sandbox denies mkdir
+                # there (EPERM), and wineserver's fatal_error() calls exit(),
+                # which kills the whole app -- observed on-device as
+                # "wineserver: mkdir /tmp/.wine-501: Operation not permitted".
+                # Wine's other branch puts it in $WINEPREFIX/.wineserver, inside
+                # the app's Documents, which is writable. Force just that one
+                # #ifdef for this TU: defining __ANDROID__ (or WINE_IOS) for all
+                # server/*.c changes other TUs and pulls Madeira-private symbols.
+                # The .tmp extension keeps it out of the *.c loop above.
+                sed 's|^#ifdef __ANDROID__.*$|#if 1  /* Husk: iOS has no writable /tmp */|' \
+                    "$src" > "$SRC/server/husk_request.tmp"
+                WS_SRC="$SRC/server/husk_request.tmp"
+                EXTRA="-x c"
+            fi
             if xcrun --sdk iphoneos clang \
                 -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$MIN" \
                 -O1 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
@@ -208,7 +226,7 @@ if [ -f "$BUILD/include/config.h" ]; then
                 -I"$BUILD" -I"$SRC/server" -I"$SHIMS/shims" -I"$SHIMS" \
                 -D__WINESRC__ \
                 $EXTRA \
-                -c "$src" -o "$OBJ/ws-$n.o" 2> "$OUT/ws-$n.err"; then
+                -c "$WS_SRC" -o "$OBJ/ws-$n.o" 2> "$OUT/ws-$n.err"; then
                 WS_OK=$((WS_OK + 1)); echo "OK   $n" >> "$OUT/wineserver-summary.txt"
             else
                 WS_BAD=$((WS_BAD + 1)); echo "FAIL $n" >> "$OUT/wineserver-summary.txt"
@@ -234,7 +252,11 @@ fi
 if [ -f "$LIBDIR/libntdll_unix.a" ] && [ -f "$LIBDIR/libwineserver_unix.a" ]; then
     echo ""
     echo "==> link probe (ntdll_unix + wineserver_unix)"
-    printf 'int wineserver_main(int, char **);\nint husk_link_probe(void){ return 0; }\n' \
+    # Call wineserver_main for real: the object chain pulled in then matches the
+    # app's exactly. Without this the probe pulls nothing, and with -all_load it
+    # pulls ntdll's virtual.o too, which needs the optional unixlib tables the
+    # app never references -- noise that hides the real gap.
+    printf 'int wineserver_main(int, char **);\nint husk_link_probe(void){ static char a[] = "wineserver"; char *v[2]; v[0] = a; v[1] = 0; return wineserver_main( 1, v ); }\n' \
         > "$OBJ/linkprobe.c"
     if xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min="$MIN" -c "$OBJ/linkprobe.c" -o "$OBJ/linkprobe.o" \
@@ -243,7 +265,7 @@ if [ -f "$LIBDIR/libntdll_unix.a" ] && [ -f "$LIBDIR/libwineserver_unix.a" ]; th
             -miphoneos-version-min="$MIN" -dynamiclib -Wl,-undefined,error \
             -o "$OUT/libhusk-wine-probe.dylib" "$OBJ/linkprobe.o" \
             "$LIBDIR/libntdll_unix.a" "$LIBDIR/libwineserver_unix.a" \
-            -framework CoreFoundation -framework Security \
+            -framework CoreFoundation -framework Security -framework IOKit \
             2> "$OUT/link.log"; then
         echo "    link OK"
     else

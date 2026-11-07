@@ -27,7 +27,10 @@
 
 #include "WineProbe.h"
 
-extern int wineserver_main(int argc, char **argv);
+/* extern "C": the archive defines this as a C symbol (_wineserver_main), and
+ * this file is Objective-C++, which would otherwise look for the mangled name.
+ * The linker says so itself when it is missing. */
+extern "C" int wineserver_main(int argc, char **argv);
 
 static volatile int g_ws_returned;
 static volatile int g_ws_result;

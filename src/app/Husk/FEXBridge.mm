@@ -56,8 +56,11 @@
 #undef HUSK_SAVED_DEBUG
 #endif
 
-// M5 needs NSBundle/NSData to reach the bundled PE image.
-#import <Foundation/Foundation.h>
+// M5 reads the bundled PE image with pure C. ci_build.sh links this file
+// against libFEXCore_all.a alone (-Wl,-undefined,error) as an early check, so
+// NSBundle/NSData would pass the app link but fail that probe for missing
+// Foundation/libobjc symbols. _NSGetExecutablePath is libSystem only.
+#include <mach-o/dyld.h>
 
 extern "C" void __clear_cache(void *start, void *end) {
     sys_icache_invalidate(start, static_cast<size_t>(
@@ -532,19 +535,44 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
 
 int64_t husk_pe_probe(void) {
     g_err[0] = 0;
-    @autoreleasepool {
-        NSString *path = [[NSBundle mainBundle] pathForResource:@"hello" ofType:@"exe"];
-        if (!path) { set_err("PE: Resources/hello.exe missing from bundle"); return -1; }
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        if (!data || data.length < 0x40) {
-            set_err("PE: cannot read %s", path.fileSystemRepresentation);
-            return -2;
-        }
-        fprintf(stderr, "[husk-pe] bundle image %s (%llu bytes)\n",
-                path.fileSystemRepresentation, (unsigned long long)data.length);
-        return husk_fex_run_pe(static_cast<const uint8_t *>(data.bytes),
-                               static_cast<size_t>(data.length));
+    // hello.exe sits next to the executable in Husk.app (project.yml copies
+    // Resources/** to the bundle root, exactly like l_intl.nls).
+    char path[4096];
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) != 0) {
+        set_err("PE: executable path too long"); return -1;
     }
+    const char *slash = strrchr(path, '/');
+    if (!slash) { set_err("PE: bad executable path %s", path); return -1; }
+    const size_t prefix = static_cast<size_t>(slash - path) + 1;
+    static const char res[] = "hello.exe";
+    if (prefix + sizeof(res) > sizeof(path)) {
+        set_err("PE: bundle path too long"); return -1;
+    }
+    memcpy(path + prefix, res, sizeof(res)); // includes the trailing NUL
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { set_err("PE: cannot open %s", path); return -2; }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f); set_err("PE: fseek failed on %s", path); return -3;
+    }
+    const long n = ftell(f);
+    if (n <= 0 || n > (16 << 20)) {
+        fclose(f); set_err("PE: bad image size %ld in %s", n, path); return -3;
+    }
+    rewind(f);
+    uint8_t *buf = new uint8_t[(size_t)n];
+    const size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) {
+        delete[] buf;
+        set_err("PE: short read (%zu of %ld)", got, n);
+        return -4;
+    }
+    fprintf(stderr, "[husk-pe] bundle image %s (%zu bytes)\n", path, got);
+    const int64_t rc = husk_fex_run_pe(buf, got);
+    delete[] buf;
+    return rc;
 }
 
 const char *husk_pe_last_error(void) {

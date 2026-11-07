@@ -47,6 +47,24 @@ int64_t husk_pe_probe(void);
 /* Human-readable reason for the last PE failure, or NULL. */
 const char *husk_pe_last_error(void);
 
+/* M6: run the SAME bundled PE, but with the Windows x64 syscall ABI.
+ *
+ * The appended stub calls the real PE entry, then makes four consecutive
+ * Windows syscalls in Wine's own stub form (mov r10,rcx; mov eax,<id>;
+ * syscall): NtClose(15), NtQueryInformationProcess(25), NtCreateFile(85),
+ * NtTerminateProcess(44). HuskSyscall dispatches them through the generated
+ * 258-entry id table in HuskWinSyscalls.h, returns NTSTATUS in RAX and lets
+ * the guest resume after each one. Returns 42 only if all four syscalls were
+ * seen in order with correct Windows ABI arguments, NTSTATUS was written
+ * back, and the guest exited with 42. Negative on setup/dispatch failure.
+ *
+ * Like the PE probe this owns the launch's ONE guest thread; arm it with the
+ * Documents/husk-m6-probe marker instead of husk-pe-probe. */
+int64_t husk_m6_probe(void);
+
+/* Human-readable reason for the last M6 failure, or NULL. */
+const char *husk_m6_last_error(void);
+
 #ifdef __cplusplus
 }
 #endif

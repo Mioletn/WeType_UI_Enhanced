@@ -18,6 +18,7 @@
  * A negative return means setup failed; husk_fex_last_error() says where.
  */
 #include "FEXBridge.h"
+#include "HuskWinSyscalls.h"
 
 // Xcode defines DEBUG=1, which collides with LogMan::DEBUG.
 #ifdef DEBUG
@@ -102,6 +103,18 @@ static std::atomic<int64_t> g_cached{-999};
 static jmp_buf g_exit_jmp;
 static int64_t g_exit_code = 0;
 
+// ---- M6: Windows syscall dispatch state -----------------------------------
+// Armed ONLY by husk_m6_probe(). A launch runs exactly one FEXCore guest
+// program (a second guest thread SIGBUSes on iOS 12.2), so the flag belongs to
+// whichever probe owns that guest; the M0/M5 Linux exit(60) path never sets it.
+static bool g_win_mode = false;
+static uint32_t g_win_seq = 0;   // Windows syscalls seen, in order
+static uint32_t g_win_hits = 0;  // bit n set when expected call n matched
+
+// Defined in the M6 section below (kept inside the strict-syntax fixture's
+// slice, which starts at the M5 banner).
+static uint64_t husk_win_dispatch(FEXCore::HLE::SyscallArguments *args);
+
 // The guest code region the probe hands to FEX. The decoder asks the syscall
 // handler whether an address is executable before decoding it
 // (Frontend::CheckRangeExecutable -> QueryGuestExecutableRange), so this has to
@@ -138,8 +151,17 @@ static int fex_munmap(void *addr, size_t len) {
 // ---------------------------------------------------------------------------
 class HuskSyscall final : public FEXCore::HLE::SyscallHandler {
 public:
+    // OS_LINUX64 is kept for BOTH probes. It is the only ABI for which the JIT
+    // (a) fills SyscallArguments and (b) writes the handler's return value back
+    // into guest RAX. OS_GENERIC deliberately spills everything and leaves the
+    // argument array uninitialised, which would break the NTSTATUS contract.
+    // Conveniently the Linux64 array is RAX,RDI,RSI,RDX,R10,R8,R9 -- it still
+    // exposes R10/RDX/R8/R9, which is exactly where Windows x64 syscall
+    // arguments live (Wine's stub begins with `mov r10,rcx` because the
+    // syscall instruction overwrites RCX with the return RIP).
     HuskSyscall() { OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64; }
     uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame *, FEXCore::HLE::SyscallArguments *args) override {
+        if (g_win_mode) return husk_win_dispatch(args);
         if (args->Argument[0] == 60) { // exit
             g_exit_code = static_cast<int64_t>(args->Argument[1]);
             longjmp(g_exit_jmp, 1);
@@ -436,7 +458,12 @@ static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
     return true;
 }
 
-static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
+static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size, bool win_mode) {
+    // M6: arm the Windows syscall dispatcher only for the probe that owns this
+    // launch's single guest thread. M0/M5 pass false and keep the Linux path.
+    g_win_mode = win_mode;
+    g_win_seq = 0;
+    g_win_hits = 0;
     // A launch runs exactly ONE guest program. The PE marker does not run the
     // M0 self-check, so initialise the Context here WITHOUT creating that
     // first guest thread. Calling husk_fex_probe() here would create two
@@ -481,23 +508,77 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
         memcpy(base + va, file + raw, rawsize);
     }
 
-    uint8_t stub[] = {
-        0xE8, 0x00, 0x00, 0x00, 0x00,             // call rel32
+    // M5 stub (Linux): call the real PE entry, then convert its eax into
+    // Linux exit(60).
+    static const uint8_t kLinuxStub[] = {
+        0xE8, 0x00, 0x00, 0x00, 0x00,             // call rel32 -> PE entry
         0x89, 0xC7,                               // mov edi, eax
         0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
-        0x0F, 0x05                                // syscall
+        0x0F, 0x05,                               // syscall
     };
+    // M6 stub (Windows): call the SAME real PE entry (eax = 42), stash the
+    // answer in ebx, then make four consecutive Windows x64 syscalls in
+    // Wine's own stub form (mov r10,rcx; mov eax,<id>; syscall). This proves
+    // more than "one syscall works": the JIT must resume guest execution after
+    // every syscall, and the handler's NTSTATUS must land back in RAX.
+    //
+    //   1 NtClose(0x1111)                       id 15 -> STATUS_SUCCESS
+    //   2 NtQueryInformationProcess(0x2222,0x3333) id 25 -> STATUS_SUCCESS
+    //   3 NtCreateFile(0x4444,0x5555)          id 85 -> STATUS_NOT_IMPLEMENTED
+    //       cmp eax,0xC0000002 / je +5 / mov ebx,-1   (poison the exit code if
+    //       the NTSTATUS was not written back, or the guest did not resume)
+    //   4 NtTerminateProcess(0x6666, ebx)      id 44 -> guest exits with 42
+    //
+    // The 0x1111..0x6666 markers are checked host-side in husk_win_dispatch,
+    // so a wrong Windows ABI argument mapping cannot produce a green result.
+    static const uint8_t kWinStub[] = {
+        0xE8, 0x00, 0x00, 0x00, 0x00,             // call rel32 -> PE entry
+        0x89, 0xC3,                               // mov ebx, eax  (stash 42)
+        // NtClose
+        0xB9, 0x11, 0x11, 0x00, 0x00,             // mov ecx, 0x1111
+        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
+        0xB8, 0x0F, 0x00, 0x00, 0x00,             // mov eax, 15
+        0x0F, 0x05,                               // syscall
+        // NtQueryInformationProcess
+        0xB9, 0x22, 0x22, 0x00, 0x00,             // mov ecx, 0x2222
+        0xBA, 0x33, 0x33, 0x00, 0x00,             // mov edx, 0x3333
+        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
+        0xB8, 0x19, 0x00, 0x00, 0x00,             // mov eax, 25
+        0x0F, 0x05,                               // syscall
+        // NtCreateFile (deliberately unimplemented)
+        0xB9, 0x44, 0x44, 0x00, 0x00,             // mov ecx, 0x4444
+        0xBA, 0x55, 0x55, 0x00, 0x00,             // mov edx, 0x5555
+        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
+        0xB8, 0x55, 0x00, 0x00, 0x00,             // mov eax, 85
+        0x0F, 0x05,                               // syscall
+        0x3D, 0x02, 0x00, 0x00, 0xC0,             // cmp eax, 0xC0000002
+        0x74, 0x05,                               // je +5
+        0xBB, 0xFF, 0xFF, 0xFF, 0xFF,             // mov ebx, -1
+        // NtTerminateProcess
+        0xB9, 0x66, 0x66, 0x00, 0x00,             // mov ecx, 0x6666
+        0x89, 0xDA,                               // mov edx, ebx
+        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
+        0xB8, 0x2C, 0x00, 0x00, 0x00,             // mov eax, 44
+        0x0F, 0x05,                               // syscall
+    };
+    static_assert(sizeof(kWinStub) < 256, "M6 stub must fit one PE page");
+    const uint8_t *tmpl = win_mode ? kWinStub : kLinuxStub;
+    const size_t stub_len = win_mode ? sizeof(kWinStub) : sizeof(kLinuxStub);
+    uint8_t stub[256];
+    memcpy(stub, tmpl, stub_len);
     const int64_t rel = (int64_t)pe.entry_rva - (int64_t)(stub_rva + 5);
     if (rel < -2147483648LL || rel > 2147483647LL) {
         set_err("PE: entry too far from stub"); ::munmap(image, map_size); return -24;
     }
     const int32_t rel32 = static_cast<int32_t>(rel);
     memcpy(stub + 1, &rel32, sizeof(rel32));
-    memcpy(base + stub_rva, stub, sizeof(stub));
+    memcpy(base + stub_rva, stub, stub_len);
 
     const uint64_t image_addr = reinterpret_cast<uint64_t>(image);
     g_code_base = image_addr;   // QueryGuestExecutableRange must cover the PE
     g_code_size = map_size;
+    husk_pe_trace(win_mode ? "m6-mapped" : "mapped",
+                  image_addr, (uint64_t)stub_len);
     husk_pe_trace("mapped", image_addr, map_size);
 
     constexpr size_t STACK_SIZE = 0x10000;
@@ -578,18 +659,34 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size) {
             image, map_size, (unsigned)pe.section_count, pe.entry_rva,
             stub_rva, (long long)rc);
 
+    int64_t result = rc;
+    if (win_mode) {
+        // A green M6 needs ALL FOUR Windows syscalls, in order, each with the
+        // correct R10/RDX arguments (bit n is set only when call n matched).
+        // rc==42 alone is not enough: a broken NTSTATUS write-back or a JIT
+        // that stops after the first syscall would poison ebx and exit -1.
+        husk_pe_trace("m6-dispatch", g_win_hits, g_win_seq);
+        if (g_win_hits != 0xFu || g_win_seq != 4u) {
+            set_err("M6: dispatch mismatch hits=0x%x seq=%u (want 0xf/4)",
+                    (unsigned)g_win_hits, (unsigned)g_win_seq);
+            result = -31;
+        }
+    }
+
+    g_win_mode = false;
     // No further guest thread will run; stop reporting an unmapped range.
     g_code_base = 0;
     g_code_size = 0;
     ::munmap(stack, STACK_SIZE);
     ::munmap(image, map_size);
-    return rc;
+    return result;
 }
 
-int64_t husk_pe_probe(void) {
+static int64_t husk_bundle_pe_probe(bool win_mode) {
     g_err[0] = 0;
     // hello.exe sits next to the executable in Husk.app (project.yml copies
-    // Resources/** to the bundle root, exactly like l_intl.nls).
+    // Resources/** to the bundle root, exactly like l_intl.nls). Both M5 and
+    // M6 execute the SAME real PE bytes; only the appended stub differs.
     char path[4096];
     uint32_t size = sizeof(path);
     if (_NSGetExecutablePath(path, &size) != 0) {
@@ -622,12 +719,93 @@ int64_t husk_pe_probe(void) {
         set_err("PE: short read (%zu of %ld)", got, n);
         return -4;
     }
-    fprintf(stderr, "[husk-pe] bundle image %s (%zu bytes)\n", path, got);
-    const int64_t rc = husk_fex_run_pe(buf, got);
+    fprintf(stderr, "[husk-%s] bundle image %s (%zu bytes)\n",
+            win_mode ? "m6" : "pe", path, got);
+    const int64_t rc = husk_fex_run_pe(buf, got, win_mode);
     delete[] buf;
     return rc;
 }
 
+int64_t husk_pe_probe(void) {
+    return husk_bundle_pe_probe(false);
+}
+
 const char *husk_pe_last_error(void) {
+    return g_err[0] ? g_err : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// M6: Windows syscall id -> handler dispatch
+//
+// Wine's PE ntdll.dll has 258 distinct syscall ids (0..257, 516 Nt*/Zw*
+// stubs). Each stub is
+//     4c 8b d1            mov r10, rcx     ; syscall overwrites rcx with RIP
+//     b8 <id32>           mov eax, <id>
+//     f6 04 25 08 03 fe 7f 01  test byte [0x7ffe0308], 1
+//     75 03               jne <wineserver path>
+//     0f 05               syscall
+//     c3                  ret
+// so RAX is the id and the arguments are in R10/RDX/R8/R9. FEXCore's
+// OS_LINUX64 SyscallArguments is RAX,RDI,RSI,RDX,R10,R8,R9: it exposes the
+// very same registers AND writes the handler's return value back to RAX.
+// husk_win_syscall_name() comes from the generated 258-entry table in
+// HuskWinSyscalls.h (exported from m5_artifact/ntdll.dll).
+//
+// M6a implements the four ids the probe exercises. Everything else returns
+// STATUS_NOT_IMPLEMENTED instead of killing the guest; M6b will route real
+// ids (NtCreateFile, NtOpenFile, ...) to wineserver requests.
+// ---------------------------------------------------------------------------
+static void husk_win_trace(uint32_t id, const char *name, uint64_t a1, uint64_t a2) {
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+                     "[husk-m6] id=%u %s r10=0x%llx rdx=0x%llx seq=%u\n",
+                     (unsigned)id, name ? name : "<unknown>",
+                     (unsigned long long)a1, (unsigned long long)a2,
+                     (unsigned)g_win_seq);
+    if (n > 0) (void)::write(2, buf, static_cast<size_t>(n));
+}
+
+static uint64_t husk_win_dispatch(FEXCore::HLE::SyscallArguments *args) {
+    const uint32_t id = static_cast<uint32_t>(args->Argument[0]); // RAX
+    // Windows x64 syscall arguments AFTER Wine's `mov r10,rcx`:
+    const uint64_t a1 = args->Argument[4]; // R10 (was RCX)
+    const uint64_t a2 = args->Argument[3]; // RDX
+    const uint64_t a3 = args->Argument[5]; // R8
+    const uint64_t a4 = args->Argument[6]; // R9
+    (void)a3; (void)a4;
+    const char *name = husk_win_syscall_name(id);
+    const uint32_t seq = g_win_seq++;
+    husk_win_trace(id, name, a1, a2);
+
+    // Bit n is set only when the n-th syscall has the right id AND the right
+    // argument registers. 0xf is required after the guest exits.
+#define HUSK_WIN_HIT(n) do { if (seq == (n)) g_win_hits |= (1u << (n)); } while (0)
+
+    switch (id) {
+    case 15: // NtClose
+        if (a1 == 0x1111u) HUSK_WIN_HIT(0);
+        return 0x00000000u; // STATUS_SUCCESS
+    case 25: // NtQueryInformationProcess
+        if (a1 == 0x2222u && a2 == 0x3333u) HUSK_WIN_HIT(1);
+        return 0x00000000u; // STATUS_SUCCESS (probe passes no output buffer)
+    case 85: // NtCreateFile: deliberately not routed to wineserver yet.
+        if (a1 == 0x4444u && a2 == 0x5555u) HUSK_WIN_HIT(2);
+        return 0xC0000002ULL; // STATUS_NOT_IMPLEMENTED
+    case 44: // NtTerminateProcess(handle, exit_status)
+        if (a1 == 0x6666u) HUSK_WIN_HIT(3);
+        g_exit_code = static_cast<int32_t>(static_cast<uint32_t>(a2));
+        longjmp(g_exit_jmp, 1);
+        return 0; // unreachable, keeps the compiler's return-path check happy
+    default:
+        return 0xC0000002ULL; // STATUS_NOT_IMPLEMENTED
+    }
+#undef HUSK_WIN_HIT
+}
+
+int64_t husk_m6_probe(void) {
+    return husk_bundle_pe_probe(true);
+}
+
+const char *husk_m6_last_error(void) {
     return g_err[0] ? g_err : nullptr;
 }

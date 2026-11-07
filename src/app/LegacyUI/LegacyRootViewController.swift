@@ -36,11 +36,26 @@ final class LegacyRootViewController: UITabBarController {
         let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0]
         let probeMarker = (docs as NSString).appendingPathComponent("husk-fex-probe")
         let peMarker = (docs as NSString).appendingPathComponent("husk-pe-probe")
+        let m6Marker = (docs as NSString).appendingPathComponent("husk-m6-probe")
         // Only ONE FEXCore guest program may run per launch: a second guest
         // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
-        // The PE marker therefore takes precedence and suppresses the M0
-        // self-check; use husk-fex-probe on its own to regression-test M0.
-        if FileManager.default.fileExists(atPath: peMarker) {
+        // The markers are therefore mutually exclusive, in this priority:
+        // m6 (Windows syscalls) > pe (Linux exit stub) > fex (M0 self-check).
+        if FileManager.default.fileExists(atPath: m6Marker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M6: same real PE bytes, but the guest now makes four Windows
+                // x64 syscalls through the 258-entry id dispatch table. rc=42
+                // means the whole sequence and the NTSTATUS write-back worked.
+                let m6Rc = husk_m6_probe()
+                var m6Msg = "husk-m6-probe: rc=\(m6Rc)"
+                if m6Rc != 42, let m6Err = husk_m6_last_error() {
+                    m6Msg += " err=\(String(cString: m6Err))"
+                }
+                HuskLog.log("m6", m6Msg)
+                let m6Log = (docs as NSString).appendingPathComponent("husk-m6-probe.log")
+                try? (m6Msg + "\n").write(toFile: m6Log, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: peMarker) {
             DispatchQueue.global(qos: .userInitiated).async {
                 // M5: freestanding PE32+ mapped and executed as the launch's
                 // only guest program. Its entry returns 42 through a stubbed

@@ -51,11 +51,25 @@ step "FEXCore bridge: link check"
 # resolution in seconds. A dylib is used because it needs no entry point.
 # husk_ios_jit_* live in the QEMU dylib, which is not built yet, so a stub
 # stands in for them here; everything else must resolve for real.
+# M6b: FEXBridge.mm also calls the two wineserver entry points that live in
+# WineProbe.mm. That file is deliberately NOT linked into this check (it pulls
+# in Foundation/ObjC and the wineserver archive), so stand in for them the
+# same way. The app target links the real WineProbe.mm implementations; these
+# stubs are only here to satisfy -undefined,error for the bridge's own symbols.
 cat > /tmp/husk_jit_stub.c <<'STUB'
 #include <stddef.h>
+#include <stdint.h>
 typedef struct { unsigned char *rw_addr; unsigned char *rx_addr; size_t size; } HuskDualMapping;
 HuskDualMapping husk_ios_jit_allocate(size_t n) { (void)n; HuskDualMapping m = {0, 0, 0}; return m; }
 const char *husk_ios_jit_self_route(void) { return "stub"; }
+int32_t husk_ws_call(int req_id, const void *payload, size_t payload_size,
+                     unsigned int *out_status)
+{
+    (void)req_id; (void)payload; (void)payload_size;
+    if (out_status) *out_status = 0xC0000002u; /* STATUS_NOT_IMPLEMENTED */
+    return -1;
+}
+int husk_ws_is_ready(void) { return 0; }
 STUB
 xcrun --sdk iphoneos clang -arch arm64 \
     -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \

@@ -239,9 +239,19 @@ if [ -f "$BUILD/include/config.h" ]; then
                 # entire app down when anything inside wineserver goes wrong.
                 # Husk starts wineserver on a thread, so end only that thread:
                 # the app stays alive and the Wine probe can write its log.
+                #
+                # Two other process-level exits live in this TU:
+                #   - close_socket_timeout() ends with exit(0) when the master
+                #     socket idle timeout fires. In a standalone wineserver that
+                #     is a clean quit; in-process it terminates Husk itself.
+                #   - acquire_lock() uses exit(2) when another server owns the
+                #     lock (also an exit, not a thread return).
+                # Both become pthread_exit(NULL) so only the server thread ends.
                 # The .tmp extension keeps it out of the *.c loop above.
                 sed -e 's|^#ifdef __ANDROID__.*$|#if 1  /* Husk: iOS has no writable /tmp */|' \
                     -e '/void fatal_error/,/^}/ s|^    exit(1);$|    pthread_exit(NULL);  /* Husk: do not kill the app */|' \
+                    -e '/static void close_socket_timeout/,/^}/ s|^    exit( 0 );$|    pthread_exit(NULL);  /* Husk: end server thread, not the app */|' \
+                    -e 's|exit(2); /\* we didn.t get the lock, exit with special status \*/|pthread_exit(NULL);  /* Husk: do not kill the app */|' \
                     "$src" > "$SRC/server/husk_request.tmp"
                 WS_SRC="$SRC/server/husk_request.tmp"
                 EXTRA="-x c -include pthread.h"

@@ -63,6 +63,26 @@ static volatile int g_ws_result;
 static int g_nls_bundled;
 static char g_error[512];
 
+/* In-process lifetime diagnostics. wineserver was written to own a whole
+ * process: several shutdown paths call exit(). Running it on a thread inside
+ * Husk makes any of those calls terminate the app. These markers go straight
+ * to fd 2 (captured into husk.log) so a probe run can distinguish a
+ * process-level exit() -- which runs atexit handlers -- from a signal or
+ * SIGKILL, which does not. stdio buffering is unreliable during teardown. */
+static void husk_lifetime_mark(const char *tag, int value)
+{
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf),
+                     "[husk] %s (ws_returned=%d ws_result=%d value=%d)\n",
+                     tag, g_ws_returned, g_ws_result, value);
+    if (n > 0) write(2, buf, (size_t)n);
+}
+
+static void husk_atexit_diag(void)
+{
+    husk_lifetime_mark("atexit: process-level exit", 0);
+}
+
 static void set_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void set_error(const char *fmt, ...)
 {
@@ -86,6 +106,7 @@ static double now_ms(void)
 static void ws_thread_cleanup(void *unused)
 {
     g_ws_returned = 2;
+    husk_lifetime_mark("wineserver thread pthread_exit (early)", 0);
 }
 
 static void *wineserver_thread(void *unused)
@@ -100,6 +121,7 @@ static void *wineserver_thread(void *unused)
     g_ws_result = wineserver_main(4, argv);
     pthread_cleanup_pop(0);
     g_ws_returned = 1;
+    husk_lifetime_mark("wineserver thread returned normally", g_ws_result);
     return NULL;
 }
 
@@ -298,6 +320,14 @@ done:
 
 int32_t husk_wine_probe(void)
 {
+    /* Register once: if any process-level exit() fires while wineserver runs
+     * in-process, husk.log records it before the app disappears. */
+    static int diag_once = 0;
+    if (!diag_once) {
+        diag_once = 1;
+        atexit(husk_atexit_diag);
+    }
+
     @autoreleasepool {
         const double t0 = now_ms();
         g_nls_bundled = 0;

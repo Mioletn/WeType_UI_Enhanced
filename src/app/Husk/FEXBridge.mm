@@ -42,6 +42,8 @@
 #include <FEXCore/Utils/LogManager.h>
 
 #include <mach/mach.h>
+#include <mach/mach_vm.h>     // M7b: mach_vm_region_recurse() lives HERE, not in
+                              // vm_region.h (which only has the info structs)
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>   // M7b: read back the protection mprotect() applied
 #include <sys/mman.h>

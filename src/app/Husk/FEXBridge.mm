@@ -812,6 +812,8 @@ static uint32_t g_vmem_pattern_ok = 0;
 static uint32_t g_vmem_free_ok = 0;
 static uint64_t g_stub_page = 0;      // base of the RX thunk page, if any
 static uint32_t g_win_bad_ptr = 0;    // guest asked us to write to a page we must not
+static uint32_t g_vmem_decommit_ok = 0;    // M8q: decommits served as PROT_NONE
+static uint32_t g_vmem_decommit_miss = 0;  // decommits over memory already gone
 
 // The thunk page is PROT_READ|PROT_EXEC. A host memcpy into it faults and kills
 // the WHOLE app with no guest-exit trace and no .ips -- exactly what happened on
@@ -1665,18 +1667,42 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
         memcpy(&base, reinterpret_cast<const void *>(a2), 8);
         memcpy(&size, reinterpret_cast<const void *>(a3), 8);
         if (!base || !size) return 0xC000000DULL;
-        // Read the pattern the guest wrote BEFORE unmapping: this is the proof
-        // that guest stores really landed in the host mapping.
-        const uint8_t *q = reinterpret_cast<const uint8_t *>(base);
-        if (q[0] == 0xAA && q[size - 0x10] == 0x55) g_vmem_pattern_ok = 1;
-        if (::munmap(reinterpret_cast<void *>(base), static_cast<size_t>(size)) == 0) {
-            g_vmem_free_ok = 1;
+        // MEM_RELEASE == 0x8000, MEM_DECOMMIT == 0x4000, and they are NOT the
+        // same operation. This used to munmap() both, which is fatal for the
+        // heap: subheap_decommit() decommits the tail of a subheap it still
+        // owns, and after a real unmap the next block walk reads unmapped
+        // memory (on device: SIGBUS at heap_base-0x8000+0x10, intermittently,
+        // depending on where the free happened to end). A decommit keeps the
+        // address space reserved and only drops the pages -- PROT_NONE, not
+        // munmap.
+        const bool release = (a4 & 0x8000ull) != 0;
+        if (release) {
+            // Read the pattern the guest wrote BEFORE unmapping: this is the
+            // proof that guest stores really landed in the host mapping.
+            const uint8_t *q = reinterpret_cast<const uint8_t *>(base);
+            if (size >= 0x10 && size <= 0x1000000ull &&
+                q[0] == 0xAA && q[size - 0x10] == 0x55) {
+                g_vmem_pattern_ok = 1;
+            }
+            if (::munmap(reinterpret_cast<void *>(base),
+                         static_cast<size_t>(size)) == 0) {
+                g_vmem_free_ok = 1;
+            }
+        } else if (::mprotect(reinterpret_cast<void *>(base),
+                              static_cast<size_t>(size), PROT_NONE) != 0) {
+            // Nothing to decommit (the range is already gone): Windows reports
+            // success for a decommit of uncommitted pages, so do the same.
+            g_vmem_decommit_miss++;
+        } else {
+            g_vmem_decommit_ok++;
         }
-        husk_pe_trace("m8b-free", base, size);
+        husk_pe_trace(release ? "m8b-free" : "m8q-decommit", base, size);
         fprintf(stderr,
-                "[husk-m8b] free base=0x%llx size=0x%llx pattern=%u type=0x%llx\n",
+                "[husk-m8b] free base=0x%llx size=0x%llx pattern=%u type=0x%llx "
+                "decommit_ok=%u decommit_miss=%u\n",
                 (unsigned long long)base, (unsigned long long)size,
-                (unsigned)g_vmem_pattern_ok, (unsigned long long)a4);
+                (unsigned)g_vmem_pattern_ok, (unsigned long long)a4,
+                g_vmem_decommit_ok, g_vmem_decommit_miss);
         return 0x00000000ULL;
     }
     case 85: // NtCreateFile: deliberately not routed to wineserver yet.

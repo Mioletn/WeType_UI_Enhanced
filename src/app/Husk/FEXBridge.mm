@@ -1597,14 +1597,28 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
             g_vmem_size = want;
             g_vmem_alloc_ok = 1;
             return 0x00000000ULL;
-        } else if (a3 && a3 < 32) {
-            // ZeroBits is the alignment request: the range must start at a
-            // multiple of 2^ZeroBits. Ignoring it (as this did until M8m) makes
-            // the caller compute offsets from an address it did not get -- the
-            // Rtl heap then walks to heap-0x4000, outside the mapping, and the
-            // probe dies with SIGBUS on a page nobody mapped. Over-allocate,
-            // trim both ends, and hand back the aligned middle.
-            const size_t align = static_cast<size_t>(1) << static_cast<unsigned>(a3);
+        } else {
+            // The kernel's page size is 16 KiB, but Windows allocates with a
+            // 64 KiB GRANULARITY, and Wine's heap depends on it: REGION_ALIGN
+            // is 0x10000, so subheap_base() is `subheap & ~0xffff` and the
+            // first subheap is assumed to start on a 64 KiB boundary. A heap
+            // that lands on a 16 KiB-only address (0x...c000, which is most of
+            // them) therefore computes its own base as the PREVIOUS 64 KiB
+            // boundary -- outside the mapping -- and find_block() rejects every
+            // block with "invalid base offset". That is why RtlFreeHeap was
+            // intermittent: it worked exactly when mmap happened to hand back a
+            // 64 KiB-aligned address.
+            //
+            // ZeroBits (the 3rd argument) asks for a power-of-two alignment on
+            // top of that; 2^ZeroBits below 0x10000 is meaningless to Windows,
+            // so the effective alignment is the larger of the two. Over-
+            // allocate, trim both ends, and hand back the aligned middle.
+            const size_t gran = 0x10000u;
+            size_t align = gran;
+            if (a3 && a3 < 32) {
+                const size_t want_align = static_cast<size_t>(1) << static_cast<unsigned>(a3);
+                if (want_align > align) align = want_align;
+            }
             void *raw = ::mmap(nullptr, want + align, mprot,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (raw == MAP_FAILED) {
@@ -1617,10 +1631,8 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
                 const size_t tail = align - head;
                 if (tail) (void)::munmap(reinterpret_cast<void *>(aligned + want), tail);
                 p = reinterpret_cast<void *>(aligned);
-                husk_pe_trace("m8b-align", aligned, align);
+                husk_pe_trace("m8r-align", aligned, align);
             }
-        } else {
-            p = ::mmap(nullptr, want, mprot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         }
         if (p == MAP_FAILED) return 0xC0000017ULL;
         g_vmem_base = reinterpret_cast<uint64_t>(p);
@@ -1968,6 +1980,55 @@ static bool husk_m7_protect(uint8_t *base, size_t map_size, const uint8_t *perms
 #define HUSK_M8A_SLOT_PEB   0x60u   /* thunk page: expected PEB pointer */
 #define HUSK_M8A_SLOT_IMG   0x68u   /* thunk page: expected image base */
 
+// ---- M9a: process parameters ---------------------------------------------
+// loader_init() reads PEB->ProcessParameters->ImagePathName before it can build
+// the main module record, and get_dll_load_path() reads DllPath. Both are
+// RTL_USER_PROCESS_PARAMETERS fields (x64 offsets from Wine's winternl.h):
+//     CurrentDirectory  0x38 (CURDIR = UNICODE_STRING + HANDLE)
+//     DllPath           0x50
+//     ImagePathName     0x60
+//     CommandLine       0x70
+// PEB.ProcessParameters is at 0x20. The block lives in the PEB page like the
+// loader list: one 16 KiB page holds the process structures, and a crash dump
+// of the page shows all of them together.
+#define HUSK_M9A_PEB_PARAMS   0x20u
+#define HUSK_M9A_OFF_PARAMS   0x600u
+#define HUSK_M9A_OFF_IMGBUF   0x800u   /* ImagePathName / CommandLine buffer */
+#define HUSK_M9A_OFF_DLLBUF   0x880u   /* DllPath buffer */
+#define HUSK_M9A_PARAMS_SIZE  0x228u
+
+static void husk_m9a_make_params(uint8_t *peb, uint64_t image_base) {
+    (void)image_base;
+    memset(peb + HUSK_M9A_OFF_PARAMS, 0, 0x228);
+    const uint32_t sz = HUSK_M9A_PARAMS_SIZE;
+    memcpy(peb + HUSK_M9A_OFF_PARAMS, &sz, 4);       /* AllocationSize */
+    memcpy(peb + HUSK_M9A_OFF_PARAMS + 4, &sz, 4);   /* Size */
+
+    // L"C:////windows////system32" -- the directory a Windows loader searches.
+    static const char dll_dir[] = "C:////windows////system32";
+    static const char img_name[] = "C:////windows////system32////ntdll.dll";
+    const uint64_t base = reinterpret_cast<uint64_t>(peb);
+    auto write_us = [&](uint32_t struct_off, uint32_t buf_off, const char *ascii) {
+        uint16_t len = 0;
+        for (; ascii[len]; len++) {
+            const uint16_t ch = static_cast<unsigned char>(ascii[len]);
+            memcpy(peb + buf_off + len * 2, &ch, 2);
+        }
+        len *= 2;                                  /* UNICODE_STRING counts BYTES */
+        const uint64_t buf = base + buf_off;
+        memcpy(peb + struct_off, &len, 2);
+        memcpy(peb + struct_off + 2, &len, 2);     /* MaxLength == Length */
+        memcpy(peb + struct_off + 8, &buf, 8);
+    };
+    write_us(HUSK_M9A_OFF_PARAMS + 0x50, HUSK_M9A_OFF_DLLBUF, dll_dir);
+    write_us(HUSK_M9A_OFF_PARAMS + 0x60, HUSK_M9A_OFF_IMGBUF, img_name);
+    write_us(HUSK_M9A_OFF_PARAMS + 0x70, HUSK_M9A_OFF_IMGBUF + 0x40, img_name);
+
+    const uint64_t params = base + HUSK_M9A_OFF_PARAMS;
+    memcpy(peb + HUSK_M9A_PEB_PARAMS, &params, 8);
+    husk_pe_trace("m9a-params", params, 0);
+}
+
 // ---- M9: a loader list the guest can walk ---------------------------------
 // PEB->Ldr is the root of everything the Windows loader is: LdrInitializeThunk
 // walks it, LdrGetDllHandle searches it, and every later import or module
@@ -2105,6 +2166,7 @@ static bool husk_m8a_make_teb(uint64_t *teb_out, uint64_t *peb_out,
     // M9: give the PEB a loader list, so PEB->Ldr is walkable and the guest can
     // ask the loader for ntdll instead of being told "nothing has been loaded".
     husk_m9_make_ldr(p, image_base);
+    husk_m9a_make_params(p, image_base);
 
     *teb_out = taddr;
     *peb_out = paddr;

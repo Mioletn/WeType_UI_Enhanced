@@ -43,6 +43,7 @@
 
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+#include <mach/vm_region.h>   // M7b: read back the protection mprotect() applied
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 
@@ -466,6 +467,97 @@ static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Run exactly ONE guest program on the shared FEXCore context and return the
+// value it handed to Linux exit(60).
+//
+// M5/M6 (freestanding PE) and M7c (real Wine ntdll.dll) all reach the JIT
+// through here. The 16 KiB callret-stack alignment below was hard-won -- an
+// unaligned mprotect() failed SILENTLY and the guest's first `call` died with
+// a SIGBUS that looked like a guest bug -- so a second, slightly different
+// copy of this sequence would be a regression waiting to happen.
+//
+// `code_base`/`code_size` is the guest range QueryGuestExecutableRange must
+// report; it must cover BOTH the entry point and every page the guest runs.
+// ---------------------------------------------------------------------------
+static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
+                             uint64_t code_size) {
+    g_code_base = code_base;
+    g_code_size = code_size;
+
+    constexpr size_t STACK_SIZE = 0x10000;
+    void *stack = ::mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) { set_err("PE: stack mmap failed"); return -25; }
+    uint64_t *sp = reinterpret_cast<uint64_t *>(
+        reinterpret_cast<uint64_t>(stack) + STACK_SIZE);
+    *(--sp) = 0; // AT_NULL value
+    *(--sp) = 0; // AT_NULL type
+    *(--sp) = 0; // envp[0]
+    *(--sp) = 0; // argv[0]
+    *(--sp) = 0; // argc
+    const uint64_t start_sp = reinterpret_cast<uint64_t>(sp);
+
+    husk_pe_trace("before-create", entry, start_sp);
+    auto *thread = g_ctx->CreateThread(entry, start_sp);
+    husk_pe_trace("after-create", reinterpret_cast<uint64_t>(thread), 0);
+    if (!thread) {
+        set_err("PE: CreateThread null");
+        ::munmap(stack, STACK_SIZE);
+        return -26;
+    }
+    {
+        constexpr size_t CR = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+        // iOS arm64 uses 16 KiB pages (sysctl hw.pagesize = 16384). mprotect()
+        // requires a page-aligned start, so the guard offset MUST be 0x4000 --
+        // the M0 probe already does this. Using PAGE=0x1000 here left crbase
+        // unaligned: mprotect silently failed, the shadow call/ret stack stayed
+        // PROT_NONE, and the PE stub's `call` faulted while pushing its return
+        // address (SIGBUS, swallowed by the trap guard, hence no .ips report).
+        constexpr size_t PG = 0x4000;
+        void *a = ::mmap(nullptr, CR + 2 * PG, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (a == MAP_FAILED) {
+            set_err("PE: callret mmap failed");
+            ::munmap(stack, STACK_SIZE);
+            return -27;
+        }
+        void *crbase = static_cast<uint8_t *>(a) + PG;
+        if (::mprotect(crbase, CR, PROT_READ | PROT_WRITE) != 0) {
+            set_err("PE: callret mprotect failed (crbase=%p CR=0x%zx PG=0x%zx)",
+                    crbase, CR, PG);
+            ::munmap(a, CR + 2 * PG);
+            ::munmap(stack, STACK_SIZE);
+            return -28;
+        }
+        // Prove the region is writable before the JIT ever touches it.
+        *reinterpret_cast<volatile uint8_t *>(crbase) = 0;
+        husk_pe_trace("callret-writable", reinterpret_cast<uint64_t>(crbase), CR);
+        thread->CallRetStackBase = crbase;
+        thread->CurrentFrame->State.callret_sp =
+            reinterpret_cast<uint64_t>(crbase) + CR / 4;
+    }
+    {
+        static FEXCore::Core::CPUState::gdt_segment gdt[1] = {};
+        gdt[0].L = 1; gdt[0].D = 0; gdt[0].P = 1; gdt[0].S = 1;
+        gdt[0].Type = 0b1011;
+        thread->CurrentFrame->State.segment_arrays[0] = gdt;
+        thread->CurrentFrame->State.cs_idx = 0;
+    }
+
+    g_exit_code = -99;
+    husk_pe_trace("before-exec", entry, 0);
+    if (setjmp(g_exit_jmp) == 0) {
+        g_ctx->ExecuteThread(thread);
+        set_err("PE: ExecuteThread returned without exit");
+        g_exit_code = -9;
+    }
+    const int64_t rc = g_exit_code;
+    husk_pe_trace("guest-exit", static_cast<uint64_t>(rc), 0);
+    ::munmap(stack, STACK_SIZE);
+    return rc;
+}
+
 static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
                                bool win_mode, bool use_ws) {
     // M6: arm the Windows syscall dispatcher only for the probe that owns this
@@ -587,85 +679,11 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
     memcpy(base + stub_rva, stub, stub_len);
 
     const uint64_t image_addr = reinterpret_cast<uint64_t>(image);
-    g_code_base = image_addr;   // QueryGuestExecutableRange must cover the PE
-    g_code_size = map_size;
     husk_pe_trace(win_mode ? "m6-mapped" : "mapped",
                   image_addr, (uint64_t)stub_len);
     husk_pe_trace("mapped", image_addr, map_size);
 
-    constexpr size_t STACK_SIZE = 0x10000;
-    void *stack = ::mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (stack == MAP_FAILED) {
-        set_err("PE: stack mmap failed");
-        ::munmap(image, map_size);
-        return -25;
-    }
-    uint64_t *sp = reinterpret_cast<uint64_t *>(
-        reinterpret_cast<uint64_t>(stack) + STACK_SIZE);
-    *(--sp) = 0; // AT_NULL value
-    *(--sp) = 0; // AT_NULL type
-    *(--sp) = 0; // envp[0]
-    *(--sp) = 0; // argv[0]
-    *(--sp) = 0; // argc
-    const uint64_t start_sp = reinterpret_cast<uint64_t>(sp);
-
-    husk_pe_trace("before-create", image_addr + stub_rva, start_sp);
-    auto *thread = g_ctx->CreateThread(image_addr + stub_rva, start_sp);
-    husk_pe_trace("after-create", reinterpret_cast<uint64_t>(thread), 0);
-    if (!thread) {
-        set_err("PE: CreateThread null");
-        ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
-        return -26;
-    }
-    {
-        constexpr size_t CR = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-        // iOS arm64 uses 16 KiB pages (sysctl hw.pagesize = 16384). mprotect()
-        // requires a page-aligned start, so the guard offset MUST be 0x4000 --
-        // the M0 probe already does this. Using PAGE=0x1000 here left crbase
-        // unaligned: mprotect silently failed, the shadow call/ret stack stayed
-        // PROT_NONE, and the PE stub's `call` faulted while pushing its return
-        // address (SIGBUS, swallowed by the trap guard, hence no .ips report).
-        constexpr size_t PG = 0x4000;
-        void *a = ::mmap(nullptr, CR + 2 * PG, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (a == MAP_FAILED) {
-            set_err("PE: callret mmap failed");
-            ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
-            return -27;
-        }
-        void *crbase = static_cast<uint8_t *>(a) + PG;
-        if (::mprotect(crbase, CR, PROT_READ | PROT_WRITE) != 0) {
-            set_err("PE: callret mprotect failed (crbase=%p CR=0x%zx PG=0x%zx)",
-                    crbase, CR, PG);
-            ::munmap(a, CR + 2 * PG);
-            ::munmap(stack, STACK_SIZE); ::munmap(image, map_size);
-            return -28;
-        }
-        // Prove the region is writable before the JIT ever touches it.
-        *reinterpret_cast<volatile uint8_t *>(crbase) = 0;
-        husk_pe_trace("callret-writable", reinterpret_cast<uint64_t>(crbase), CR);
-        thread->CallRetStackBase = crbase;
-        thread->CurrentFrame->State.callret_sp =
-            reinterpret_cast<uint64_t>(crbase) + CR / 4;
-    }
-    {
-        static FEXCore::Core::CPUState::gdt_segment gdt[1] = {};
-        gdt[0].L = 1; gdt[0].D = 0; gdt[0].P = 1; gdt[0].S = 1;
-        gdt[0].Type = 0b1011;
-        thread->CurrentFrame->State.segment_arrays[0] = gdt;
-        thread->CurrentFrame->State.cs_idx = 0;
-    }
-
-    g_exit_code = -99;
-    husk_pe_trace("before-exec", image_addr + stub_rva, 0);
-    if (setjmp(g_exit_jmp) == 0) {
-        g_ctx->ExecuteThread(thread);
-        set_err("PE: ExecuteThread returned without exit");
-        g_exit_code = -9;
-    }
-    const int64_t rc = g_exit_code;
-    husk_pe_trace("guest-exit", static_cast<uint64_t>(rc), 0);
+    const int64_t rc = husk_fex_exec(image_addr + stub_rva, image_addr, map_size);
     fprintf(stderr,
             "[husk-pe] image=%p map=0x%zx sections=%u entry=0x%x stub=0x%zx exit=%lld\n",
             image, map_size, (unsigned)pe.section_count, pe.entry_rva,
@@ -697,7 +715,6 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
     // No further guest thread will run; stop reporting an unmapped range.
     g_code_base = 0;
     g_code_size = 0;
-    ::munmap(stack, STACK_SIZE);
     ::munmap(image, map_size);
     return result;
 }
@@ -907,6 +924,205 @@ struct HuskM7Mapping {
     }
 };
 
+// ---------------------------------------------------------------------------
+// M7b: give the mapped image the protection its sections ask for.
+//
+// iOS refuses an RWX mapping without a JIT entitlement, so a loader cannot
+// leave 4.8 MB of guest memory PROT_READ|PROT_WRITE and call it done. The page
+// plan is not guessed here: gen_m7b_page_map.py derives it from the same
+// section table, and check_m7b.py asserts the run/page counts below against
+// that file, so a stale image cannot silently pass.
+//
+// SectionAlignment is 4 KB while a device page is 16 KB, so pages are merged
+// by required permission; M7a measured that no 16 KB page needs both W and X
+// (mixed16k=0), which is what makes real W^X-safe protection possible at all.
+// ---------------------------------------------------------------------------
+#define HUSK_M7B_RUNS    5u    /* contiguous ranges with equal protection */
+#define HUSK_M7B_RX      31u
+#define HUSK_M7B_RW       6u
+#define HUSK_M7B_R       235u
+#define HUSK_M7C_RUNS    6u    /* M7c adds one RX range for the thunk page */
+#define HUSK_M7C_RX      32u
+#define HUSK_M7C_R       234u
+
+struct HuskM7Prot {
+    uint32_t calls;         // mprotect() ranges issued
+    uint32_t ok;            // ranges that ended up protected
+    uint32_t fail;
+    uint32_t verified;      // ranges whose protection read back as requested
+    uint32_t exec_refused;  // ranges where PROT_EXEC had to be dropped
+    uint32_t rx, rw, r, none, wx;
+};
+
+// perms[] bit 0 = needs X, bit 1 = needs W. Every byte of this image is
+// readable, so PROT_READ is the floor -- PROT_NONE is never correct here.
+static int husk_m7_prot(uint8_t mask) {
+    int p = PROT_READ;
+    if (mask & 2u) p |= PROT_WRITE;
+    if (mask & 1u) p |= PROT_EXEC;
+    return p;
+}
+
+// Ask the kernel what protection a page really has; mprotect() returning 0 is
+// not proof (the 16 KiB alignment lesson from M5).
+static bool husk_m7_query_prot(void *addr, int *prot) {
+    mach_vm_address_t a = reinterpret_cast<mach_vm_address_t>(addr);
+    mach_vm_size_t sz = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    const kern_return_t kr = ::mach_vm_region_recurse(
+        mach_task_self(), &a, &sz, &depth,
+        reinterpret_cast<vm_region_recurse_info_t>(&info), &cnt);
+    if (kr != KERN_SUCCESS) return false;
+    *prot = info.protection;
+    return true;
+}
+
+static bool husk_m7_protect(uint8_t *base, size_t map_size, const uint8_t *perms,
+                            uint32_t npages, HuskM7Prot *st) {
+    memset(st, 0, sizeof(*st));
+    uint32_t pg = 0;
+    while (pg < npages) {
+        int prot = husk_m7_prot(perms[pg]);
+        uint32_t end = pg + 1;
+        while (end < npages && husk_m7_prot(perms[end]) == prot) end++;
+        const size_t bytes = static_cast<size_t>(end - pg) * HUSK_M7_PAGE;
+        uint8_t *addr = base + static_cast<size_t>(pg) * HUSK_M7_PAGE;
+        if (addr + bytes > base + map_size) {
+            set_err("M7b: run ends past the mapping (page %u)", pg);
+            return false;
+        }
+        st->calls++;
+        int mrc = ::mprotect(addr, bytes, prot);
+        if (mrc != 0 && (prot & PROT_EXEC)) {
+            // Some iOS configurations refuse PROT_EXEC on anonymous memory
+            // without a JIT entitlement. That is a device CAPABILITY, not a
+            // loader bug: drop X, keep R/W, and report it honestly.
+            st->exec_refused++;
+            prot &= ~PROT_EXEC;
+            mrc = ::mprotect(addr, bytes, prot);
+        }
+        if (mrc == 0) st->ok++;
+        else st->fail++;
+
+        int got = 0;
+        const int want = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
+        if (husk_m7_query_prot(addr, &got) &&
+            (got & (PROT_READ | PROT_WRITE | PROT_EXEC)) == want) {
+            st->verified++;
+        }
+        for (uint32_t k = pg; k < end; k++) {
+            if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) st->wx++;
+            else if (prot & PROT_EXEC) st->rx++;
+            else if (prot & PROT_WRITE) st->rw++;
+            else st->r++;
+        }
+        pg = end;
+    }
+    return st->fail == 0 && st->verified == st->calls && st->wx == 0;
+}
+
+// ---------------------------------------------------------------------------
+// M7c: execute code that came out of the Windows binary.
+//
+// SizeOfImage ends at 0x43e000, i.e. 8 KB before the end of page 271, so the
+// unused tail of that page is a safe home for the thunk -- no extra mapping,
+// and the image itself is untouched.
+//
+// The thunk calls RtlCompareMemory (RVA 0x1de80) twice through the Windows x64
+// ABI (rcx, rdx, r8) and exits with 42 only if BOTH answers are right:
+//
+//   call 1: 16 bytes differing at index 9   -> expects 9
+//   call 2: 16 identical bytes              -> expects 16 (length, not index)
+//
+// The data lives at fixed offsets inside the same page and is addressed
+// RIP-relative, so the probe depends on no register the guest may clobber and
+// on no host-provided pointer. Exit codes 100+n / 150+n report the wrong
+// answer from call 1 / call 2 instead of a bare failure.
+// ---------------------------------------------------------------------------
+#define HUSK_M7C_STUB_RVA    0x43e000u
+#define HUSK_M7C_RTLCOMPARE  0x1de80u
+#define HUSK_M7C_DATA1       0x80u
+#define HUSK_M7C_DATA2       0x90u
+#define HUSK_M7C_DATA3       0xa0u
+#define HUSK_M7C_DATA4       0xb0u
+
+static bool husk_m7c_write_stub(uint8_t *base, size_t map_size) {
+    // Placeholders (0x00) are patched below; check_m7b.py decodes the result
+    // with capstone and asserts every displacement and branch target.
+    static const uint8_t tmpl[] = {
+        0x48, 0x8D, 0x0D, 0, 0, 0, 0,             // lea rcx, [rip+d1]
+        0x48, 0x8D, 0x15, 0, 0, 0, 0,             // lea rdx, [rip+d2]
+        0x41, 0xB8, 0x10, 0x00, 0x00, 0x00,       // mov r8d, 16
+        0xE8, 0, 0, 0, 0,                         // call RtlCompareMemory
+        0x83, 0xF8, 0x09,                         // cmp eax, 9
+        0x75, 0,                                  // jne fail1 (patched)
+        0x48, 0x8D, 0x0D, 0, 0, 0, 0,             // lea rcx, [rip+d3]
+        0x48, 0x8D, 0x15, 0, 0, 0, 0,             // lea rdx, [rip+d4]
+        0x41, 0xB8, 0x10, 0x00, 0x00, 0x00,       // mov r8d, 16
+        0xE8, 0, 0, 0, 0,                         // call RtlCompareMemory
+        0x83, 0xF8, 0x10,                         // cmp eax, 16
+        0x75, 0,                                  // jne fail2 (patched)
+        0xBF, 0x2A, 0x00, 0x00, 0x00,             // mov edi, 42
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05,                               // syscall
+        0x0F, 0x0B,                               // ud2 (unreachable)
+        // fail1 @0x4a: exit 100 + eax
+        0x83, 0xC0, 0x64,                         // add eax, 100
+        0x89, 0xC7,                               // mov edi, eax
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05,                               // syscall
+        // fail2 @0x56: exit 150 + eax
+        0x83, 0xC0, 0x96,                         // add eax, 150
+        0x89, 0xC7,                               // mov edi, eax
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05,                               // syscall
+    };
+    if ((uint64_t)HUSK_M7C_STUB_RVA + sizeof(tmpl) > map_size) {
+        set_err("M7c: thunk does not fit the tail page"); return false;
+    }
+    uint8_t *stub = base + HUSK_M7C_STUB_RVA;
+    memcpy(stub, tmpl, sizeof(tmpl));
+
+    // Displacements are computed PAGE-RELATIVE: the data blocks and the call
+    // target are both addressed from this one page, so `target_off - next_off`
+    // is exact and independent of where iOS actually maps the image.
+    const int64_t rtl_off =
+        (int64_t)HUSK_M7C_RTLCOMPARE - (int64_t)HUSK_M7C_STUB_RVA;
+    struct Patch { uint32_t at; int64_t target; uint32_t next; };
+    const Patch patches[] = {
+        {0x03, (int64_t)HUSK_M7C_DATA1, 0x07},
+        {0x0A, (int64_t)HUSK_M7C_DATA2, 0x0E},
+        {0x15, rtl_off, 0x19},
+        {0x21, (int64_t)HUSK_M7C_DATA3, 0x25},
+        {0x28, (int64_t)HUSK_M7C_DATA4, 0x2C},
+        {0x33, rtl_off, 0x37},
+    };
+    for (const Patch &q : patches) {
+        const int64_t disp = q.target - (int64_t)q.next;
+        if (disp < -2147483648LL || disp > 2147483647LL) {
+            set_err("M7c: displacement out of range (0x%llx)",
+                    (unsigned long long)disp);
+            return false;
+        }
+        const int32_t d32 = static_cast<int32_t>(disp);
+        memcpy(stub + q.at, &d32, sizeof(d32));
+    }
+    stub[0x1D] = static_cast<uint8_t>(0x4A - 0x1E);   // jne fail1
+    stub[0x3B] = static_cast<uint8_t>(0x56 - 0x3C);   // jne fail2
+
+    for (uint32_t i = 0; i < 16; i++) {
+        stub[HUSK_M7C_DATA1 + i] = static_cast<uint8_t>(i);
+        stub[HUSK_M7C_DATA3 + i] = static_cast<uint8_t>(0x20 + i);
+        // Call 1 differs at index 9; call 2 is byte-identical to its partner.
+        stub[HUSK_M7C_DATA2 + i] =
+            static_cast<uint8_t>(i == 9 ? 0xFF : i);
+        stub[HUSK_M7C_DATA4 + i] = static_cast<uint8_t>(0x20 + i);
+    }
+    return true;
+}
+
 // Owned by the fixture too: compare a NUL-terminated name inside the mapped
 // image against a literal without pulling in strcmp/memcmp declarations.
 static bool husk_m7_name_eq(const uint8_t *base, uint32_t limit,
@@ -964,7 +1180,12 @@ static bool husk_m7_parse(const uint8_t *d, size_t n, HuskM7PE *out) {
     return true;
 }
 
-static int64_t husk_m7_load(const uint8_t *file, size_t n) {
+// stage: HUSK_M7_MAP (M7a, layout only), HUSK_M7_PROTECT (M7b, + real page
+// permissions), HUSK_M7_EXEC (M7c, + run real ntdll code). Keeping one loader
+// for all three means the bytes M7c executes are the exact bytes M7a verified.
+enum { HUSK_M7_MAP = 0, HUSK_M7_PROTECT = 1, HUSK_M7_EXEC = 2 };
+
+static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     HuskM7PE pe{};
     if (!husk_m7_parse(file, n, &pe)) return -41;
 
@@ -979,6 +1200,7 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n) {
 
     const size_t map_size =
         (pe.size_of_image + HUSK_M7_PAGE - 1) & ~(size_t)(HUSK_M7_PAGE - 1);
+    const uint32_t npages = static_cast<uint32_t>(map_size / HUSK_M7_PAGE);
     HuskM7Mapping map{};
     map.p = ::mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1119,14 +1341,98 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n) {
     fprintf(stderr,
             "[husk-m7] image=%p map=0x%zx delta=0x%llx sections=%u "
             "reloc=%u/%u blocks=%u exports=%u ldr=0x%x disp=0x%x "
-            "mixed16k=%u unwind=%u rc=42\n",
+            "mixed16k=%u unwind=%u stage=%d\n",
             base, map_size, (unsigned long long)delta, copied, dir64, pad,
             blocks, nname, ldr_rva, disp_rva, mixed_pages,
-            pe.exception_size / 12);
+            pe.exception_size / 12, stage);
+
+    if (stage == HUSK_M7_MAP) {
+        fprintf(stderr, "[husk-m7] rc=42\n");
+        return 42;
+    }
+
+    // M7c: the thunk needs an executable page, and SizeOfImage leaves 8 KiB of
+    // page 271 unused, so that page becomes RX instead of R.
+    if (stage == HUSK_M7_EXEC) {
+        const uint32_t stub_page = HUSK_M7C_STUB_RVA / HUSK_M7_PAGE;
+        if (stub_page >= npages) { set_err("M7c: thunk page outside image"); return -55; }
+        perms[stub_page] |= 1u;
+        if (!husk_m7c_write_stub(base, map_size)) return -55;
+        husk_pe_trace("m7c-stub", HUSK_M7C_STUB_RVA, 0x62);
+    }
+
+    HuskM7Prot st{};
+    if (!husk_m7_protect(base, map_size, perms, npages, &st)) {
+        set_err("M7: page protection failed calls=%u ok=%u fail=%u "
+                "verified=%u wx=%u", st.calls, st.ok, st.fail, st.verified, st.wx);
+        return -54;
+    }
+    const bool exec_stage = (stage == HUSK_M7_EXEC);
+    const uint32_t want_runs = exec_stage ? HUSK_M7C_RUNS : HUSK_M7B_RUNS;
+    const uint32_t want_rx = exec_stage ? HUSK_M7C_RX : HUSK_M7B_RX;
+    const uint32_t want_r = exec_stage ? HUSK_M7C_R : HUSK_M7B_R;
+    fprintf(stderr,
+            "[husk-m7b] protect calls=%u ok=%u verified=%u exec_refused=%u "
+            "rx=%u rw=%u r=%u wx=%u pages=%u\n",
+            st.calls, st.ok, st.verified, st.exec_refused,
+            st.rx, st.rw, st.r, st.wx, st.rx + st.rw + st.r);
+    if (st.ok != want_runs || st.verified != want_runs) {
+        set_err("M7b: %u/%u ranges protected, %u verified",
+                st.ok, want_runs, st.verified);
+        return -54;
+    }
+    // If this iOS build refuses PROT_EXEC on anonymous memory, those pages fell
+    // back to R -- a different but equally correct page map. Anything else is a
+    // real mismatch.
+    bool counts_ok;
+    if (st.exec_refused == 0) {
+        counts_ok = st.rx == want_rx && st.rw == HUSK_M7B_RW && st.r == want_r;
+    } else {
+        counts_ok = st.rx == 0 && st.rw == HUSK_M7B_RW &&
+                    st.r == want_r + want_rx;
+    }
+    if (!counts_ok) {
+        set_err("M7b: page map mismatch rx=%u/%u rw=%u/%u r=%u/%u refused=%u",
+                st.rx, want_rx, st.rw, HUSK_M7B_RW, st.r, want_r,
+                st.exec_refused);
+        return -54;
+    }
+    if (!exec_stage) {
+        fprintf(stderr, "[husk-m7b] rc=42\n");
+        return 42;
+    }
+
+    // ---- M7c: run RtlCompareMemory straight out of the mapped ntdll -------
+    if (!g_ctx) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (!g_ctx) {
+            const int64_t initrc = husk_fex_init();
+            if (initrc != 0 || !g_ctx) {
+                set_err("M7c: FEXCore init failed (rc=%lld)", (long long)initrc);
+                return -56;
+            }
+        }
+    }
+    g_win_mode = false;   // Linux exit(60) path: the guest exits through us
+    g_win_use_ws = false;
+    const int64_t rc = husk_fex_exec(
+        reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA,
+        reinterpret_cast<uint64_t>(base), map_size);
+    g_code_base = 0;
+    g_code_size = 0;
+    fprintf(stderr,
+            "[husk-m7c] rtlcompare stub=0x%x target=0x%x exit=%lld want=42\n",
+            HUSK_M7C_STUB_RVA, HUSK_M7C_RTLCOMPARE, (long long)rc);
+    if (rc != 42) {
+        // 100+n / 150+n mean call 1 / call 2 returned n instead of 9 / 16.
+        set_err("M7c: real ntdll code returned exit=%lld (want 42)", (long long)rc);
+        return -57;
+    }
+    fprintf(stderr, "[husk-m7c] rc=42\n");
     return 42;
 }
 
-int64_t husk_m7_probe(void) {
+static int64_t husk_m7_bundle_probe(int stage) {
     g_err[0] = 0;
     // ntdll.dll is pushed next to the executable by deploy_wine_probe.py;
     // it is deliberately NOT baked into the IPA (4.8 MB of build artefact).
@@ -1163,9 +1469,21 @@ int64_t husk_m7_probe(void) {
         return -4;
     }
     fprintf(stderr, "[husk-m7] bundle image %s (%zu bytes)\n", path, got);
-    const int64_t rc = husk_m7_load(buf, got);
+    const int64_t rc = husk_m7_load(buf, got, stage);
     delete[] buf;
     return rc;
+}
+
+int64_t husk_m7_probe(void) {
+    return husk_m7_bundle_probe(HUSK_M7_MAP);
+}
+
+int64_t husk_m7b_probe(void) {
+    return husk_m7_bundle_probe(HUSK_M7_PROTECT);
+}
+
+int64_t husk_m7c_probe(void) {
+    return husk_m7_bundle_probe(HUSK_M7_EXEC);
 }
 
 const char *husk_m7_last_error(void) {

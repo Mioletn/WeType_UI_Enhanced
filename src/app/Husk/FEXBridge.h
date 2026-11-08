@@ -82,6 +82,21 @@ const char *husk_m6_last_error(void);
  * success, a negative setup/parse error otherwise. */
 int64_t husk_m7_probe(void);
 
+/* M7b: same layout as M7a, then hand every 16 KB page the protection its
+ * sections ask for (RX / RW / R, merged into 5 mprotect ranges) and read the
+ * result back with mach_vm_region_recurse. Reports whether this iOS build
+ * allows PROT_EXEC on anonymous memory at all (exec_refused). Still no guest
+ * thread: it cannot regress M0-M7a. Returns 42 on success. */
+int64_t husk_m7b_probe(void);
+
+/* M7c: M7b plus the first REAL execution of Windows code. A thunk in the
+ * unused 8 KiB of the last page calls ntdll's RtlCompareMemory (RVA 0x1de80)
+ * twice through the Windows x64 ABI and exits 42 only if both answers are
+ * correct. No TEB/PEB: that function is a leaf that touches nothing but its
+ * arguments. Returns 42 on success, 100+n / 150+n come back as a negative
+ * error reporting the wrong answer from call 1 / call 2. */
+int64_t husk_m7c_probe(void);
+
 /* Human-readable reason for the last M7 failure, or NULL. */
 const char *husk_m7_last_error(void);
 

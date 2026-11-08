@@ -39,12 +39,46 @@ final class LegacyRootViewController: UITabBarController {
         let m6Marker = (docs as NSString).appendingPathComponent("husk-m6-probe")
         let m6bMarker = (docs as NSString).appendingPathComponent("husk-m6b-probe")
         let m7Marker = (docs as NSString).appendingPathComponent("husk-m7-probe")
+        let m7bMarker = (docs as NSString).appendingPathComponent("husk-m7b-probe")
+        let m7cMarker = (docs as NSString).appendingPathComponent("husk-m7c-probe")
         // Only ONE FEXCore guest program may run per launch: a second guest
         // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
         // The markers are therefore mutually exclusive, in this priority:
-        // m7 (real DLL map, host-only) > m6b (syscall -> wineserver) >
-        // m6 (Windows syscalls) > pe (Linux exit stub) > fex (M0 self-check).
-        if FileManager.default.fileExists(atPath: m7Marker) {
+        // m7c (real DLL + real ntdll execution) > m7b (real DLL + page
+        // protections) > m7 (real DLL map, host-only) >
+        // m6b (syscall -> wineserver) > m6 (Windows syscalls) >
+        // pe (Linux exit stub) > fex (M0 self-check).
+        if FileManager.default.fileExists(atPath: m7cMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M7c: the first execution of REAL Windows code on this
+                // device. Loads the 4.8 MB Wine ntdll.dll, applies real page
+                // protections, then runs RtlCompareMemory through FEXCore with
+                // no TEB/PEB at all. rc=42 needs both comparisons correct.
+                let m7cRc = husk_m7c_probe()
+                var m7cMsg = "husk-m7c-probe: rc=\(m7cRc)"
+                if m7cRc != 42, let m7cErr = husk_m7_last_error() {
+                    m7cMsg += " err=\(String(cString: m7cErr))"
+                }
+                HuskLog.log("m7c", m7cMsg)
+                let m7cLog = (docs as NSString).appendingPathComponent("husk-m7c-probe.log")
+                try? (m7cMsg + "\n").write(toFile: m7cLog, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: m7bMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M7b: same map as M7a, then the real per-16 KB-page
+                // protections (RX/RW/R in 5 mprotect ranges) read back with
+                // mach_vm_region_recurse. No guest thread: it cannot consume
+                // this launch's single JIT region.
+                let m7bRc = husk_m7b_probe()
+                var m7bMsg = "husk-m7b-probe: rc=\(m7bRc)"
+                if m7bRc != 42, let m7bErr = husk_m7_last_error() {
+                    m7bMsg += " err=\(String(cString: m7bErr))"
+                }
+                HuskLog.log("m7b", m7bMsg)
+                let m7bLog = (docs as NSString).appendingPathComponent("husk-m7b-probe.log")
+                try? (m7bMsg + "\n").write(toFile: m7bLog, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: m7Marker) {
             DispatchQueue.global(qos: .userInitiated).async {
                 // M7a is pure host-side PE loading: no FEXCore guest thread,
                 // no TEB/PEB, so it cannot consume this launch's single JIT

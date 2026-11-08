@@ -716,23 +716,50 @@ static void husk_fatal_arm(const char *tag, uint64_t entry, uint64_t base,
 // region when the address itself is unmapped, so a region that starts at or
 // after addr+len proves the range is free. (Same quirk that made M8b's
 // "unmapped" check wrong the other way round.)
-// The Mach region that contains `addr`, if any. Used by
-// NtFreeVirtualMemory(MEM_RELEASE, size=0), where Windows releases the whole
-// reservation and *RegionSize is deliberately zero.
-static bool husk_region_of(uint64_t addr, uint64_t *start, uint64_t *size) {
-    vm_address_t a = static_cast<vm_address_t>(addr);
-    vm_size_t sz = 0;
-    natural_t depth = 0;
-    vm_region_submap_info_data_64_t info;
-    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-    const kern_return_t kr = ::vm_region_recurse_64(
-        mach_task_self(), &a, &sz, &depth,
-        reinterpret_cast<vm_region_recurse_info_t>(&info), &cnt);
-    if (kr != KERN_SUCCESS) return false;
-    if (!(a <= addr && sz && addr < a + sz)) return false;
-    if (start) *start = a;
-    if (size) *size = sz;
-    return true;
+// ---- M8s: reservations, so MEM_RELEASE can mean "this one" ----------------
+// MEM_RELEASE with *RegionSize == 0 means "the whole reservation" -- the range
+// ONE NtAllocateVirtualMemory call reserved. The Mach region is not that: two
+// reservations can share one region (the loader's own release asked for
+// base=0x...600 inside a 64 KiB region that still held live structures at
+// +0x38), and releasing the whole region killed them. Windows tracks the
+// reservation; so must we.
+struct HuskRes {
+    uint64_t base, size;
+    uint32_t used;
+};
+enum { HUSK_RES_N = 64 };
+static HuskRes g_res[HUSK_RES_N];
+
+static void husk_res_add(uint64_t base, uint64_t size) {
+    for (int i = 0; i < HUSK_RES_N; i++) {
+        if (g_res[i].used) continue;
+        g_res[i].base = base;
+        g_res[i].size = size;
+        g_res[i].used = 1;
+        return;
+    }
+}
+
+// The reservation that contains `addr`, if any.
+static bool husk_res_find(uint64_t addr, uint64_t *base, uint64_t *size) {
+    for (int i = 0; i < HUSK_RES_N; i++) {
+        if (!g_res[i].used) continue;
+        if (addr >= g_res[i].base && addr < g_res[i].base + g_res[i].size) {
+            if (base) *base = g_res[i].base;
+            if (size) *size = g_res[i].size;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void husk_res_remove(uint64_t base) {
+    for (int i = 0; i < HUSK_RES_N; i++) {
+        if (g_res[i].used && g_res[i].base == base) {
+            g_res[i].used = 0;
+            return;
+        }
+    }
 }
 
 static bool husk_addr_is_free(uint64_t addr, size_t len) {
@@ -1612,6 +1639,7 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
             const uint64_t keep_base = base, keep_size = want;
             if (a2) memcpy(reinterpret_cast<void *>(a2), &keep_base, 8);
             if (a4) memcpy(reinterpret_cast<void *>(a4), &keep_size, 8);
+            husk_res_add(base, want);
             g_vmem_base = base;
             g_vmem_size = want;
             g_vmem_alloc_ok = 1;
@@ -1654,6 +1682,9 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
             }
         }
         if (p == MAP_FAILED) return 0xC0000017ULL;
+        // Remember the reservation so a later MEM_RELEASE with size 0 can
+        // find exactly this range and nothing around it.
+        husk_res_add(reinterpret_cast<uint64_t>(p), want);
         g_vmem_base = reinterpret_cast<uint64_t>(p);
         g_vmem_size = want;
         g_vmem_alloc_ok = 1;
@@ -1707,10 +1738,11 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
         if (!release && !size) return 0xC000000DULL;
         if (release && !size) {
             uint64_t rstart = 0, rsize = 0;
-            if (!husk_region_of(base, &rstart, &rsize)) return 0xC000000DULL;
+            if (!husk_res_find(base, &rstart, &rsize)) return 0xC000000DULL;
             base = rstart;
             size = rsize;
         }
+        if (release) husk_res_remove(base);
         // MEM_RELEASE == 0x8000, MEM_DECOMMIT == 0x4000, and they are NOT the
         // same operation. This used to munmap() both, which is fatal for the
         // heap: subheap_decommit() decommits the tail of a subheap it still

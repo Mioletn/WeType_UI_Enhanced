@@ -42,15 +42,32 @@ final class LegacyRootViewController: UITabBarController {
         let m7bMarker = (docs as NSString).appendingPathComponent("husk-m7b-probe")
         let m7cMarker = (docs as NSString).appendingPathComponent("husk-m7c-probe")
         let m8aMarker = (docs as NSString).appendingPathComponent("husk-m8a-probe")
+        let m8bMarker = (docs as NSString).appendingPathComponent("husk-m8b-probe")
         // Only ONE FEXCore guest program may run per launch: a second guest
         // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
         // The markers are therefore mutually exclusive, in this priority:
+        // m8b (guest virtual memory via Nt*VirtualMemory) >
         // m8a (TEB/PEB + gs-relative ntdll call) >
         // m7c (real DLL + real ntdll execution) > m7b (real DLL + page
         // protections) > m7 (real DLL map, host-only) >
         // m6b (syscall -> wineserver) > m6 (Windows syscalls) >
         // pe (Linux exit stub) > fex (M0 self-check).
-        if FileManager.default.fileExists(atPath: m8aMarker) {
+        if FileManager.default.fileExists(atPath: m8bMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M8b: the guest allocates 64 KiB through NtAllocateVirtualMemory
+                // (id 24, six args -> two on the stack), writes pattern bytes,
+                // reads one back and frees it through NtFreeVirtualMemory (id 30).
+                // rc=42 means the whole Windows virtual-memory path works.
+                let m8bRc = husk_m8b_probe()
+                var m8bMsg = "husk-m8b-probe: rc=\(m8bRc)"
+                if m8bRc != 42, let m8bErr = husk_m7_last_error() {
+                    m8bMsg += " err=\(String(cString: m8bErr))"
+                }
+                HuskLog.log("m8b", m8bMsg)
+                let m8bLog = (docs as NSString).appendingPathComponent("husk-m8b-probe.log")
+                try? (m8bMsg + "\n").write(toFile: m8bLog, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: m8aMarker) {
             DispatchQueue.global(qos: .userInitiated).async {
                 // M8a: builds a TEB/PEB, points FEXCore's gs base at the TEB
                 // and calls ntdll's RtlGetCurrentPeb, which is literally

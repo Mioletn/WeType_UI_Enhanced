@@ -106,6 +106,14 @@ int64_t husk_m7c_probe(void);
  * pointer was wrong. */
 int64_t husk_m8a_probe(void);
 
+/* M8b: guest virtual memory. The guest calls NtAllocateVirtualMemory (id 24,
+ * six arguments, so the last two arrive on the stack) and NtFreeVirtualMemory
+ * (id 30); husk_win_dispatch satisfies them with mmap/munmap. The thunk writes
+ * two pattern bytes into the returned region, reads one back and frees it; the
+ * host then checks the kernel no longer maps it. Returns 42 on success, and
+ * exits 220/221/222/223 identify which step failed. */
+int64_t husk_m8b_probe(void);
+
 /* Human-readable reason for the last M7 failure, or NULL. */
 const char *husk_m7_last_error(void);
 

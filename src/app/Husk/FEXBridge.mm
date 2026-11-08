@@ -1333,8 +1333,39 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         // page-aligned without depending on the M7 section's constant.
         const size_t want = static_cast<size_t>((size + 0x3fffull) &
                                                 ~(uint64_t)0x3fffull);
-        void *p = ::mmap(nullptr, want, husk_win_prot(static_cast<uint32_t>(prot)),
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        const int mprot = husk_win_prot(static_cast<uint32_t>(prot));
+        void *p = MAP_FAILED;
+        if (base) {
+            // A fixed address means the caller is committing inside a region it
+            // already reserved -- which is exactly what RtlAllocateHeap does
+            // when it grows a segment. Two rules follow:
+            //
+            //   * an ALREADY MAPPED range must be left alone. Re-mapping it with
+            //     MAP_ANON would zero pages the caller has already written, and
+            //     the heap stores its own block headers there. (Symptom before
+            //     this fix: RtlAllocateHeap returned a block, writing through it
+            //     worked, but RtlSizeHeap said -1 and RtlFreeHeap said FALSE --
+            //     the heap's bookkeeping did not match what it had asked for.)
+            //   * an unmapped one is created where it was asked for, not
+            //     wherever the kernel likes.
+            if (!husk_addr_is_free(base, want)) {
+                husk_pe_trace("m8b-commit", base, want);
+                const uint64_t keep_base = base, keep_size = want;
+                if (a2) memcpy(reinterpret_cast<void *>(a2), &keep_base, 8);
+                if (a4) memcpy(reinterpret_cast<void *>(a4), &keep_size, 8);
+                g_vmem_base = base;
+                g_vmem_size = want;
+                g_vmem_alloc_ok = 1;
+                fprintf(stderr,
+                        "[husk-m8b] commit base=0x%llx size=0x%llx (already mapped)\n",
+                        (unsigned long long)base, (unsigned long long)want);
+                return 0x00000000ULL;
+            }
+            p = ::mmap(reinterpret_cast<void *>(base), want, mprot,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        } else {
+            p = ::mmap(nullptr, want, mprot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        }
         if (p == MAP_FAILED) return 0xC0000017ULL;
         g_vmem_base = reinterpret_cast<uint64_t>(p);
         g_vmem_size = want;

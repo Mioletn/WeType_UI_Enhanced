@@ -716,6 +716,25 @@ static void husk_fatal_arm(const char *tag, uint64_t entry, uint64_t base,
 // region when the address itself is unmapped, so a region that starts at or
 // after addr+len proves the range is free. (Same quirk that made M8b's
 // "unmapped" check wrong the other way round.)
+// The Mach region that contains `addr`, if any. Used by
+// NtFreeVirtualMemory(MEM_RELEASE, size=0), where Windows releases the whole
+// reservation and *RegionSize is deliberately zero.
+static bool husk_region_of(uint64_t addr, uint64_t *start, uint64_t *size) {
+    vm_address_t a = static_cast<vm_address_t>(addr);
+    vm_size_t sz = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    const kern_return_t kr = ::vm_region_recurse_64(
+        mach_task_self(), &a, &sz, &depth,
+        reinterpret_cast<vm_region_recurse_info_t>(&info), &cnt);
+    if (kr != KERN_SUCCESS) return false;
+    if (!(a <= addr && sz && addr < a + sz)) return false;
+    if (start) *start = a;
+    if (size) *size = sz;
+    return true;
+}
+
 static bool husk_addr_is_free(uint64_t addr, size_t len) {
     vm_address_t a = static_cast<vm_address_t>(addr);
     vm_size_t sz = 0;
@@ -1678,7 +1697,20 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
         }
         memcpy(&base, reinterpret_cast<const void *>(a2), 8);
         memcpy(&size, reinterpret_cast<const void *>(a3), 8);
-        if (!base || !size) return 0xC000000DULL;
+        if (!base) return 0xC000000DULL;
+        // MEM_RELEASE with *RegionSize == 0 is legal and common: it means "the
+        // whole reservation". loader_init() releases exactly that way, and the
+        // old `!size -> INVALID_PARAMETER` sent it off a cliff (device: the
+        // vmem transcript shows op=30 type=0x8000 req_size=0 st=0xc000000d,
+        // then a crash at pc=0). A decommit, in contrast, must name a range.
+        const bool release = (a4 & 0x8000ull) != 0;
+        if (!release && !size) return 0xC000000DULL;
+        if (release && !size) {
+            uint64_t rstart = 0, rsize = 0;
+            if (!husk_region_of(base, &rstart, &rsize)) return 0xC000000DULL;
+            base = rstart;
+            size = rsize;
+        }
         // MEM_RELEASE == 0x8000, MEM_DECOMMIT == 0x4000, and they are NOT the
         // same operation. This used to munmap() both, which is fatal for the
         // heap: subheap_decommit() decommits the tail of a subheap it still
@@ -1687,7 +1719,6 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
         // depending on where the free happened to end). A decommit keeps the
         // address space reserved and only drops the pages -- PROT_NONE, not
         // munmap.
-        const bool release = (a4 & 0x8000ull) != 0;
         if (release) {
             // Read the pattern the guest wrote BEFORE unmapping: this is the
             // proof that guest stores really landed in the host mapping.

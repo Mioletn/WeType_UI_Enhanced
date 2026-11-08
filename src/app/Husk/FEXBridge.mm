@@ -464,6 +464,10 @@ static volatile uint64_t g_gw_entry, g_gw_base, g_gw_size, g_gw_gs, g_gw_stack;
 static volatile int g_gw_live;
 static char g_gw_tag[24] = "none";
 
+// M8n: defined with the syscall ring further down; the fatal report calls it
+// to append the transcript of what the guest was doing when it died.
+static void husk_ring_dump(const char *tag, uint32_t want);
+
 // Optional trail page owned by the script harness (M8s). A script that stores a
 // step counter here leaves a record of how far it got, because the report below
 // survives the crash that stopped it.
@@ -610,6 +614,11 @@ static void husk_fatal_handler(int sig, siginfo_t *info, void *uctx) {
     }
     at = hf_str(buf, sizeof(buf), at, "\n");
     hf_flush(buf, at);
+
+    // The transcript: every Windows syscall still in the ring, oldest first.
+    // This is what turns "fault at heap_base-0x3ff0" into "the guest committed
+    // that page at seq=N and then read it at seq=N+3".
+    husk_ring_dump("fatal", 0);
 
     // And the script's own trail, if the script kept one.
     if (g_fatal_trail && g_fatal_trail_len) {
@@ -827,20 +836,70 @@ static uint64_t husk_win_stack_arg(FEXCore::Core::CpuStateFrame *f, uint32_t n) 
     return v;
 }
 
-// Windows page protections -> host PROT_*. Only the two values the probe uses
-// are mapped exactly; everything else falls back to RW, which is what a probe
-// allocation wants anyway.
+// Windows page protections -> host PROT_*.
+//
+// The two constants that matter here are the ends of the range: PAGE_NOACCESS
+// (0x01) and the PAGE_*_READWRITE family. This used to map 0x01 to RWX -- off
+// by one whole step, because 0x01 was labelled PAGE_EXECUTE and PAGE_EXECUTE is
+// really 0x10. A reserve therefore came back *readable and writable*, which
+// hides the single most common heap bug there is: touching a page you only
+// reserved. Now 0x01 is PROT_NONE, exactly as Windows has it.
 static int husk_win_prot(uint32_t win) {
     switch (win & 0xffu) {
-    case 0x01: return PROT_READ | PROT_WRITE | PROT_EXEC;       // PAGE_EXECUTE
+    case 0x01: return PROT_NONE;                                // PAGE_NOACCESS
     case 0x02: return PROT_READ;                                // PAGE_READONLY
     case 0x04: return PROT_READ | PROT_WRITE;                   // PAGE_READWRITE
     case 0x08: return PROT_READ | PROT_WRITE;                   // PAGE_WRITECOPY
-    case 0x10: return PROT_READ | PROT_WRITE | PROT_EXEC;       // PAGE_EXECUTE_READ
-    case 0x20: return PROT_READ | PROT_WRITE | PROT_EXEC;       // PAGE_EXECUTE_READWRITE
-    case 0x40: return PROT_READ | PROT_WRITE | PROT_EXEC;       // PAGE_EXECUTE_WRITECOPY
+    case 0x10: return PROT_READ | PROT_EXEC;                    // PAGE_EXECUTE
+    case 0x20: return PROT_READ | PROT_EXEC;                    // PAGE_EXECUTE_READ
+    case 0x40: return PROT_READ | PROT_WRITE | PROT_EXEC;       // PAGE_EXECUTE_READWRITE
+    case 0x80: return PROT_READ | PROT_WRITE | PROT_EXEC;       // PAGE_EXECUTE_WRITECOPY
     default:   return PROT_READ | PROT_WRITE;
     }
+}
+
+// ---- M8n: commit a fixed-base request page by page ------------------------
+// RtlCreateHeap does not allocate its storage at once. It RESERVES a range, and
+// the heap then commits pages inside that range one at a time as blocks are
+// handed out -- committing the page *below* the heap base first, because
+// Wine's virtual storage grows downwards from heap->base.
+//
+// The old code answered "already mapped" for any fixed-base request that landed
+// inside the reserve and returned STATUS_SUCCESS without touching the page's
+// protection. The reservation had been made with PAGE_NOACCESS, so the heap
+// then read a page that was mapped but inaccessible -- SIGBUS, at an address
+// that looks nonsensical (heap_base - 0x4000 + 0x10) until you know the
+// storage grows down. That is the intermittent heap failure in one sentence.
+//
+// So: per page, mmap only what is genuinely absent (MAP_FIXED over a live page
+// would zero it, which is what broke the first version of this path), and
+// mprotect everything else. mprotect changes permissions only -- the contents
+// survive -- and it is the operation a commit actually is.
+static bool husk_commit_fixed(uint64_t base, size_t len, int mprot,
+                              bool is_commit, uint32_t *mapped_pages,
+                              uint32_t *kept_pages, uint32_t *failed_pages) {
+    const uint64_t page = 0x4000ull;
+    uint32_t m = 0, k = 0, f = 0;
+    for (uint64_t p = base; p < base + len; p += page) {
+        if (husk_addr_is_free(p, page)) {
+            void *r = ::mmap(reinterpret_cast<void *>(p), page, mprot,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (r == MAP_FAILED) f++;
+            else m++;
+        } else if (!is_commit) {
+            // A pure MEM_RESERVE never changes the access of a page that is
+            // already mapped: doing so would take read/write away from live
+            // heap data the caller is still using.
+            k++;
+        } else {
+            if (::mprotect(reinterpret_cast<void *>(p), page, mprot) == 0) k++;
+            else f++;
+        }
+    }
+    if (mapped_pages) *mapped_pages = m;
+    if (kept_pages) *kept_pages = k;
+    if (failed_pages) *failed_pages = f;
+    return f == 0;
 }
 static uint16_t pe_rd16(const uint8_t *p) {
     uint16_t v; memcpy(&v, p, sizeof(v)); return v;
@@ -1025,6 +1084,10 @@ static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
     g_gw_live = 0;
     husk_pe_trace("guest-exit", static_cast<uint64_t>(rc), 0);
     husk_fatal_note("guest-exit", static_cast<uint64_t>(rc), 0);
+    // A clean exit still gets a transcript tail: it is the only record of what
+    // the guest asked the kernel for on a run that did NOT crash, and the heap
+    // probe needs it to show the reserve/commit sequence behind its result.
+    if (g_win_mode && g_win_seq) husk_ring_dump("exit", 16);
     ::munmap(stack, STACK_SIZE);
     return rc;
 }
@@ -1274,15 +1337,84 @@ static void husk_win_trace(uint32_t id, const char *name, uint64_t a1, uint64_t 
     if (n > 0) (void)::write(2, buf, static_cast<size_t>(n));
 }
 
-static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
-                                  FEXCore::HLE::SyscallArguments *args) {
-    const uint32_t id = static_cast<uint32_t>(args->Argument[0]); // RAX
-    // Windows x64 syscall arguments AFTER Wine's `mov r10,rcx`:
-    const uint64_t a1 = args->Argument[4]; // R10 (was RCX)
-    const uint64_t a2 = args->Argument[3]; // RDX
-    const uint64_t a3 = args->Argument[5]; // R8
-    const uint64_t a4 = args->Argument[6]; // R9
-    (void)a3; (void)a4;
+// ---- M8n: the last N Windows syscalls, kept for the crash report -----------
+// "The app disappeared" was diagnosable only because the fatal handler exists.
+// What it could not say is *what the guest was doing*: an address like
+// heap_base-0x3ff0 means nothing without the NtAllocateVirtualMemory that
+// created the neighbourhood. This ring keeps the last 64 calls -- id, guest
+// RIP, all four register arguments and the status we returned -- and the fatal
+// handler writes it out. A guest RIP is the one thing a Windows crash report
+// has that an iOS one does not, and it names the caller outright.
+struct HuskRingEntry {
+    uint32_t id;
+    uint32_t seq;
+    uint64_t rip;       // State.rip as FEXCore had it (block-granular)
+    uint64_t caller;    // guest return address sitting on top of the stack
+    uint64_t a1, a2, a3, a4;
+    uint64_t ret;
+};
+enum { HUSK_RING_N = 64 };
+static HuskRingEntry g_ring[HUSK_RING_N];
+static uint32_t g_ring_at = 0;      // next slot to write
+static uint32_t g_ring_count = 0;   // entries ever written, capped at N
+static const uint64_t HUSK_RING_PENDING = 0xdeadbeefdeadbeefull;
+
+static HuskRingEntry *husk_ring_push(uint32_t id, uint64_t rip, uint64_t caller,
+                                     uint64_t a1, uint64_t a2,
+                                     uint64_t a3, uint64_t a4) {
+    HuskRingEntry *e = &g_ring[g_ring_at];
+    g_ring_at = (g_ring_at + 1) % HUSK_RING_N;
+    if (g_ring_count < HUSK_RING_N) g_ring_count++;
+    e->id = id;
+    e->seq = g_win_seq;   // the id the body is about to use, not the previous one
+    e->rip = rip;
+    e->caller = caller;
+    e->a1 = a1; e->a2 = a2; e->a3 = a3; e->a4 = a4;
+    e->ret = HUSK_RING_PENDING;
+    return e;
+}
+
+// Oldest first, so the log reads like a transcript. `want` caps the output
+// (0 = everything the ring holds).
+static void husk_ring_dump(const char *tag, uint32_t want) {
+    if (!g_ring_count) return;
+    if (!want || want > g_ring_count) want = g_ring_count;
+    const uint32_t first = (g_ring_at + HUSK_RING_N - want) % HUSK_RING_N;
+    for (uint32_t i = 0; i < want; i++) {
+        const HuskRingEntry *e = &g_ring[(first + i) % HUSK_RING_N];
+        char b[224];
+        size_t at = 0;
+        at = hf_str(b, sizeof(b), at, "[husk-ring] ");
+        at = hf_str(b, sizeof(b), at, tag);
+        at = hf_str(b, sizeof(b), at, " seq=");
+        at = hf_dec(b, sizeof(b), at, static_cast<int>(e->seq));
+        at = hf_str(b, sizeof(b), at, " id=");
+        at = hf_dec(b, sizeof(b), at, static_cast<int>(e->id));
+        at = hf_str(b, sizeof(b), at, " rip=");
+        at = hf_hex(b, sizeof(b), at, e->rip);
+        at = hf_str(b, sizeof(b), at, " caller=");
+        at = hf_hex(b, sizeof(b), at, e->caller);
+        at = hf_str(b, sizeof(b), at, " a1=");
+        at = hf_hex(b, sizeof(b), at, e->a1);
+        at = hf_str(b, sizeof(b), at, " a2=");
+        at = hf_hex(b, sizeof(b), at, e->a2);
+        at = hf_str(b, sizeof(b), at, " a3=");
+        at = hf_hex(b, sizeof(b), at, e->a3);
+        at = hf_str(b, sizeof(b), at, " a4=");
+        at = hf_hex(b, sizeof(b), at, e->a4);
+        at = hf_str(b, sizeof(b), at, " ret=");
+        if (e->ret == HUSK_RING_PENDING) at = hf_str(b, sizeof(b), at, "?");
+        else at = hf_hex(b, sizeof(b), at, e->ret);
+        at = hf_str(b, sizeof(b), at, "\n");
+        hf_flush(b, at);
+    }
+}
+
+static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
+                                       FEXCore::HLE::SyscallArguments *args,
+                                       uint32_t id, uint64_t a1, uint64_t a2,
+                                       uint64_t a3, uint64_t a4) {
+    (void)args; (void)a3; (void)a4;
     const char *name = husk_win_syscall_name(id);
     const uint32_t seq = g_win_seq++;
     husk_win_trace(id, name, a1, a2);
@@ -1336,33 +1468,33 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         const int mprot = husk_win_prot(static_cast<uint32_t>(prot));
         void *p = MAP_FAILED;
         if (base) {
-            // A fixed address means the caller is committing inside a region it
-            // already reserved -- which is exactly what RtlAllocateHeap does
-            // when it grows a segment. Two rules follow:
-            //
-            //   * an ALREADY MAPPED range must be left alone. Re-mapping it with
-            //     MAP_ANON would zero pages the caller has already written, and
-            //     the heap stores its own block headers there. (Symptom before
-            //     this fix: RtlAllocateHeap returned a block, writing through it
-            //     worked, but RtlSizeHeap said -1 and RtlFreeHeap said FALSE --
-            //     the heap's bookkeeping did not match what it had asked for.)
-            //   * an unmapped one is created where it was asked for, not
-            //     wherever the kernel likes.
-            if (!husk_addr_is_free(base, want)) {
-                husk_pe_trace("m8b-commit", base, want);
-                const uint64_t keep_base = base, keep_size = want;
-                if (a2) memcpy(reinterpret_cast<void *>(a2), &keep_base, 8);
-                if (a4) memcpy(reinterpret_cast<void *>(a4), &keep_size, 8);
-                g_vmem_base = base;
-                g_vmem_size = want;
-                g_vmem_alloc_ok = 1;
-                fprintf(stderr,
-                        "[husk-m8b] commit base=0x%llx size=0x%llx (already mapped)\n",
-                        (unsigned long long)base, (unsigned long long)want);
-                return 0x00000000ULL;
-            }
-            p = ::mmap(reinterpret_cast<void *>(base), want, mprot,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            // A fixed address means the caller wants the range HERE: either a
+            // commit inside a range it already reserved, or a fresh mapping at
+            // an address it chose. husk_commit_fixed() is the only correct
+            // answer for both -- see its comment. It never MAP_FIXEDs over a
+            // live page (that would zero heap headers the caller already
+            // wrote); it mprotects those instead.
+            // MEM_COMMIT == 0x1000, MEM_RESERVE == 0x2000. A request that
+            // only reserves must not re-protect live pages; one that commits
+            // (with or without a reserve) must.
+            const bool is_commit = (type & 0x1000ull) != 0;
+            uint32_t mp = 0, kp = 0, fp = 0;
+            const bool ok = husk_commit_fixed(base, want, mprot, is_commit,
+                                              &mp, &kp, &fp);
+            husk_pe_trace("m8n-commit", base, want);
+            fprintf(stderr,
+                    "[husk-m8n] commit base=0x%llx size=0x%llx prot=0x%llx "
+                    "mapped=%u kept=%u failed=%u\n",
+                    (unsigned long long)base, (unsigned long long)want,
+                    (unsigned long long)prot, mp, kp, fp);
+            if (!ok) return 0xC0000017ULL; // NO_MEMORY: the range is not ours
+            const uint64_t keep_base = base, keep_size = want;
+            if (a2) memcpy(reinterpret_cast<void *>(a2), &keep_base, 8);
+            if (a4) memcpy(reinterpret_cast<void *>(a4), &keep_size, 8);
+            g_vmem_base = base;
+            g_vmem_size = want;
+            g_vmem_alloc_ok = 1;
+            return 0x00000000ULL;
         } else if (a3 && a3 < 32) {
             // ZeroBits is the alignment request: the range must start at a
             // multiple of 2^ZeroBits. Ignoring it (as this did until M8m) makes
@@ -1459,6 +1591,36 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         return 0xC0000002ULL; // STATUS_NOT_IMPLEMENTED
     }
 #undef HUSK_WIN_HIT
+}
+
+// The wrapper every guest syscall actually enters: record it, run it, fill in
+// the status it returned. A syscall that does not return (NtTerminateProcess
+// longjmps out) keeps HUSK_RING_PENDING, which is itself the answer -- the ring
+// then ends exactly at the call that ended the process.
+static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
+                                  FEXCore::HLE::SyscallArguments *args) {
+    const uint32_t id = static_cast<uint32_t>(args->Argument[0]); // RAX
+    // Windows x64 syscall arguments AFTER Wine's `mov r10,rcx`:
+    const uint64_t a1 = args->Argument[4]; // R10 (was RCX)
+    const uint64_t a2 = args->Argument[3]; // RDX
+    const uint64_t a3 = args->Argument[5]; // R8
+    const uint64_t a4 = args->Argument[6]; // R9
+    const uint64_t rip = frame ? frame->State.rip : 0;
+    // The word on top of the guest stack is the address the ntdll stub will
+    // `ret` to -- i.e. the ntdll code that called the stub. State.rip is only
+    // block-granular (it may point at the start of the translated block), so
+    // this is the sharper of the two for naming a caller.
+    uint64_t caller = 0;
+    if (frame) {
+        const uint64_t sp = frame->State.gregs[FEXCore::X86State::REG_RSP];
+        if (sp >= 0x10000ull && sp < 0x0000800000000000ull) {
+            memcpy(&caller, reinterpret_cast<const void *>(sp), 8);
+        }
+    }
+    HuskRingEntry *e = husk_ring_push(id, rip, caller, a1, a2, a3, a4);
+    const uint64_t ret = husk_win_dispatch_body(frame, args, id, a1, a2, a3, a4);
+    if (e) e->ret = ret;
+    return ret;
 }
 
 int64_t husk_m6_probe(void) {

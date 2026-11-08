@@ -1363,6 +1363,28 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
             }
             p = ::mmap(reinterpret_cast<void *>(base), want, mprot,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        } else if (a3 && a3 < 32) {
+            // ZeroBits is the alignment request: the range must start at a
+            // multiple of 2^ZeroBits. Ignoring it (as this did until M8m) makes
+            // the caller compute offsets from an address it did not get -- the
+            // Rtl heap then walks to heap-0x4000, outside the mapping, and the
+            // probe dies with SIGBUS on a page nobody mapped. Over-allocate,
+            // trim both ends, and hand back the aligned middle.
+            const size_t align = static_cast<size_t>(1) << static_cast<unsigned>(a3);
+            void *raw = ::mmap(nullptr, want + align, mprot,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw == MAP_FAILED) {
+                p = MAP_FAILED;
+            } else {
+                const uintptr_t start = reinterpret_cast<uintptr_t>(raw);
+                const uintptr_t aligned = (start + align - 1) & ~(uintptr_t)(align - 1);
+                const size_t head = aligned - start;
+                if (head) (void)::munmap(raw, head);
+                const size_t tail = align - head;
+                if (tail) (void)::munmap(reinterpret_cast<void *>(aligned + want), tail);
+                p = reinterpret_cast<void *>(aligned);
+                husk_pe_trace("m8b-align", aligned, align);
+            }
         } else {
             p = ::mmap(nullptr, want, mprot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         }
@@ -1377,9 +1399,10 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         // fprintf above may be lost, but write(2) lines are already in the log.
         husk_pe_trace("m8b-alloc", outb, outsz);
         fprintf(stderr,
-                "[husk-m8b] alloc base=0x%llx size=0x%llx type=0x%llx prot=0x%llx\n",
+                "[husk-m8b] alloc base=0x%llx size=0x%llx type=0x%llx prot=0x%llx zb=%llu\n",
                 (unsigned long long)outb, (unsigned long long)outsz,
-                (unsigned long long)type, (unsigned long long)prot);
+                (unsigned long long)type, (unsigned long long)prot,
+                (unsigned long long)a3);
         return 0x00000000ULL; // STATUS_SUCCESS
     }
     case 80: { // NtProtectVirtualMemory(handle,*base,*size,new_prot,*old_prot)

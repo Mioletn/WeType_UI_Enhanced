@@ -49,6 +49,10 @@
 // that actually exists on this platform.
 #include <mach/vm_region.h>
 #include <sys/mman.h>
+#include <sys/ucontext.h>   // M8f: the faulting pc/sp/lr, for the fatal report
+#include <fcntl.h>          // M8f: open() flags for the signal-safe write path
+#include <signal.h>
+#include <unistd.h>
 #include <libkern/OSCacheControl.h>
 
 #include <atomic>
@@ -413,6 +417,209 @@ const char *husk_fex_last_error(void) {
 // bytes were mapped, decoded and executed by the JIT.
 // ---------------------------------------------------------------------------
 
+// ---- M8f: fatal-signal report ---------------------------------------------
+// Three probes have now died with NOTHING in any log: no guest-exit trace, no
+// new .ips, the app simply gone. The signal was always there -- it just had
+// nowhere to go. stderr is a pipe drained by a Swift thread that dies with the
+// process, so its tail is lost exactly when it matters most.
+//
+// This handler writes one line to Documents/husk-fatal.log with nothing but
+// open/write/close (all async-signal-safe), then hands the signal back to
+// whoever owned it -- the JIT trap guard services its own brk through SIGBUS
+// and must keep working -- and lets the kernel kill us as it would have anyway.
+//
+// The line carries the fault address, the host pc, and where those two sit
+// relative to the guest. That classification is the whole point: a fault at
+// 0x30 means "a gs: access with no gs base", a fault inside the image names the
+// guest function by RVA, and neither is guessable from "the app disappeared".
+enum { HUSK_FATAL_SEGV, HUSK_FATAL_BUS, HUSK_FATAL_ILL, HUSK_FATAL_FPE,
+       HUSK_FATAL_COUNT };
+static const int g_fatal_sig[HUSK_FATAL_COUNT] = {
+    SIGSEGV, SIGBUS, SIGILL, SIGFPE
+};
+static struct sigaction g_fatal_prev[HUSK_FATAL_COUNT];
+static char g_fatal_path[1024];
+static volatile sig_atomic_t g_fatal_installed;
+static volatile sig_atomic_t g_in_fatal;
+
+// The guest window, refreshed by husk_fatal_arm() right before each execution.
+static volatile uint64_t g_gw_entry, g_gw_base, g_gw_size, g_gw_gs, g_gw_stack;
+static volatile int g_gw_live;
+static char g_gw_tag[24] = "none";
+
+// snprintf is not async-signal-safe, so the report is formatted by hand.
+static size_t hf_str(char *b, size_t cap, size_t at, const char *s) {
+    while (s && *s && at + 1 < cap) b[at++] = *s++;
+    return at;
+}
+static size_t hf_hex(char *b, size_t cap, size_t at, uint64_t v) {
+    at = hf_str(b, cap, at, "0x");
+    if (at + 1 >= cap) return at;
+    if (!v) { b[at++] = '0'; return at; }
+    char tmp[16];
+    int n = 0;
+    while (v && n < 16) { tmp[n++] = "0123456789abcdef"[v & 0xfu]; v >>= 4; }
+    while (n && at + 1 < cap) b[at++] = tmp[--n];
+    return at;
+}
+static size_t hf_dec(char *b, size_t cap, size_t at, int v) {
+    char tmp[12];
+    int n = 0;
+    unsigned u = v < 0 ? static_cast<unsigned>(-v) : static_cast<unsigned>(v);
+    if (v < 0 && at + 1 < cap) b[at++] = '-';
+    do { tmp[n++] = static_cast<char>('0' + u % 10u); u /= 10u; } while (u && n < 12);
+    while (n && at + 1 < cap) b[at++] = tmp[--n];
+    return at;
+}
+static void hf_flush(const char *b, size_t n) {
+    if (!g_fatal_path[0] || !n) return;
+    const int fd = ::open(g_fatal_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    (void)::write(fd, b, n);
+    ::close(fd);
+}
+
+static const char *husk_fatal_sig_name(int sig) {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS:  return "SIGBUS";
+    case SIGILL:  return "SIGILL";
+    case SIGFPE:  return "SIGFPE";
+    default:      return "SIGNAL";
+    }
+}
+
+// A milestone, so a crash is bracketed by the last point the guest reached.
+static void husk_fatal_note(const char *label, uint64_t a, uint64_t b) {
+    if (!g_fatal_installed) return;
+    char buf[192];
+    size_t at = 0;
+    at = hf_str(buf, sizeof(buf), at, "[husk-fatal] note ");
+    at = hf_str(buf, sizeof(buf), at, label);
+    at = hf_str(buf, sizeof(buf), at, " a=");
+    at = hf_hex(buf, sizeof(buf), at, a);
+    at = hf_str(buf, sizeof(buf), at, " b=");
+    at = hf_hex(buf, sizeof(buf), at, b);
+    at = hf_str(buf, sizeof(buf), at, "\n");
+    hf_flush(buf, at);
+}
+
+static void husk_fatal_handler(int sig, siginfo_t *info, void *uctx) {
+    if (g_in_fatal) {   // faulted while reporting: hand it straight back
+        for (int i = 0; i < HUSK_FATAL_COUNT; i++) {
+            if (g_fatal_sig[i] == sig) sigaction(sig, &g_fatal_prev[i], nullptr);
+        }
+        raise(sig);
+        return;
+    }
+    g_in_fatal = 1;
+
+    uint64_t pc = 0, sp = 0, lr = 0;
+    if (uctx) {
+        const ucontext_t *uc = static_cast<const ucontext_t *>(uctx);
+        pc = uc->uc_mcontext->__ss.__pc;
+        sp = uc->uc_mcontext->__ss.__sp;
+        lr = uc->uc_mcontext->__ss.__lr;
+    }
+    const uint64_t addr =
+        reinterpret_cast<uint64_t>(info ? info->si_addr : nullptr);
+
+    const uint64_t rx = reinterpret_cast<uint64_t>(g_rx);
+    const char *where = "host";
+    if (g_rx && pc >= rx && pc < rx + g_pool) {
+        where = "jit";
+    } else if (g_gw_live && pc >= g_gw_base && pc < g_gw_base + g_gw_size) {
+        where = "image";
+    }
+
+    const char *verdict = "outside every guest mapping";
+    if (addr < 0x10000ull) {
+        verdict = "near-null (a gs: access with no gs base reads 0x30)";
+    } else if (g_gw_live && addr >= g_gw_base && addr < g_gw_base + g_gw_size) {
+        verdict = "inside the mapped image";
+    } else if (g_gw_live && addr >= g_gw_stack && addr < g_gw_stack + 0x10000ull) {
+        verdict = "inside the 64 KiB guest stack";
+    }
+
+    char buf[512];
+    size_t at = 0;
+    at = hf_str(buf, sizeof(buf), at, "[husk-fatal] sig=");
+    at = hf_dec(buf, sizeof(buf), at, sig);
+    at = hf_str(buf, sizeof(buf), at, " ");
+    at = hf_str(buf, sizeof(buf), at, husk_fatal_sig_name(sig));
+    at = hf_str(buf, sizeof(buf), at, " addr=");
+    at = hf_hex(buf, sizeof(buf), at, addr);
+    at = hf_str(buf, sizeof(buf), at, " pc=");
+    at = hf_hex(buf, sizeof(buf), at, pc);
+    at = hf_str(buf, sizeof(buf), at, " in=");
+    at = hf_str(buf, sizeof(buf), at, where);
+    at = hf_str(buf, sizeof(buf), at, " sp=");
+    at = hf_hex(buf, sizeof(buf), at, sp);
+    at = hf_str(buf, sizeof(buf), at, " lr=");
+    at = hf_hex(buf, sizeof(buf), at, lr);
+    at = hf_str(buf, sizeof(buf), at, " seg=");
+    at = hf_str(buf, sizeof(buf), at, g_gw_tag);
+    at = hf_str(buf, sizeof(buf), at, " entry=");
+    at = hf_hex(buf, sizeof(buf), at, g_gw_entry);
+    at = hf_str(buf, sizeof(buf), at, " gs=");
+    at = hf_hex(buf, sizeof(buf), at, g_gw_gs);
+    at = hf_str(buf, sizeof(buf), at, " -> ");
+    at = hf_str(buf, sizeof(buf), at, verdict);
+    at = hf_str(buf, sizeof(buf), at, "\n");
+    hf_flush(buf, at);
+
+    // Hand it back rather than swallowing it: SIGBUS may belong to the JIT trap
+    // guard (its brk must still be stepped over), and a genuine fault has to
+    // reach the kernel so the system still writes a crash report.
+    for (int i = 0; i < HUSK_FATAL_COUNT; i++) {
+        if (g_fatal_sig[i] == sig) sigaction(sig, &g_fatal_prev[i], nullptr);
+    }
+    raise(sig);
+}
+
+// Idempotent; every probe entry point calls it. The file is truncated per run so
+// a stale crash cannot be mistaken for this one.
+static void husk_fatal_install(void) {
+    if (g_fatal_installed) return;
+    const char *home = getenv("HOME");
+    const int k = home
+        ? snprintf(g_fatal_path, sizeof(g_fatal_path),
+                   "%s/Documents/husk-fatal.log", home)
+        : -1;
+    if (k <= 0 || static_cast<size_t>(k) >= sizeof(g_fatal_path)) {
+        g_fatal_path[0] = 0;
+        return;
+    }
+    (void)::unlink(g_fatal_path);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = husk_fatal_handler;
+    sigemptyset(&sa.sa_mask);
+    for (int i = 0; i < HUSK_FATAL_COUNT; i++) {
+        if (sigaction(g_fatal_sig[i], &sa, &g_fatal_prev[i]) != 0) {
+            fprintf(stderr, "[husk-fatal] sigaction(%s) failed\n",
+                    husk_fatal_sig_name(g_fatal_sig[i]));
+        }
+    }
+    g_fatal_installed = 1;
+    husk_fatal_note("guard-installed", 0, 0);
+}
+
+// Declare the guest program the handler should attribute a fault to.
+static void husk_fatal_arm(const char *tag, uint64_t entry, uint64_t base,
+                           uint64_t size, uint64_t gs, uint64_t stack) {
+    snprintf(g_gw_tag, sizeof(g_gw_tag), "%s", tag ? tag : "?");
+    g_gw_entry = entry;
+    g_gw_base = base;
+    g_gw_size = size;
+    g_gw_gs = gs;
+    g_gw_stack = stack;
+    g_gw_live = 1;
+    husk_fatal_note("armed", entry, gs);
+}
+
 // ---- M8b: guest virtual memory served by our own dispatcher ----------------
 // The guest asks the Windows way (NtAllocateVirtualMemory / NtFreeVirtualMemory)
 // and we satisfy it with mmap/munmap on the same address space. This is the
@@ -554,7 +761,8 @@ struct HuskEntryRegs {
 
 static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
                              uint64_t code_size, uint64_t gs_base,
-                             const HuskEntryRegs *regs) {
+                             const HuskEntryRegs *regs, const char *tag) {
+    husk_fatal_install();
     g_code_base = code_base;
     g_code_size = code_size;
 
@@ -634,13 +842,17 @@ static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
 
     g_exit_code = -99;
     husk_pe_trace("before-exec", entry, 0);
+    husk_fatal_arm(tag, entry, code_base, code_size, gs_base,
+                   reinterpret_cast<uint64_t>(stack));
     if (setjmp(g_exit_jmp) == 0) {
         g_ctx->ExecuteThread(thread);
         set_err("PE: ExecuteThread returned without exit");
         g_exit_code = -9;
     }
     const int64_t rc = g_exit_code;
+    g_gw_live = 0;
     husk_pe_trace("guest-exit", static_cast<uint64_t>(rc), 0);
+    husk_fatal_note("guest-exit", static_cast<uint64_t>(rc), 0);
     ::munmap(stack, STACK_SIZE);
     return rc;
 }
@@ -771,7 +983,7 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
     husk_pe_trace("mapped", image_addr, map_size);
 
     const int64_t rc = husk_fex_exec(image_addr + stub_rva, image_addr, map_size,
-                                    0, nullptr);
+                                     0, nullptr, win_mode ? "m6" : "pe");
     fprintf(stderr,
             "[husk-pe] image=%p map=0x%zx sections=%u entry=0x%x stub=0x%zx exit=%lld\n",
             image, map_size, (unsigned)pe.section_count, pe.entry_rva,
@@ -1840,6 +2052,9 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
                                        reinterpret_cast<uint64_t>(base))) return -58;
             }
             husk_pe_trace("m8s-script", clen, dlen);
+            // Also into the durable file: if the script crashes, stderr's tail
+            // is lost but this survives and says what was being run.
+            husk_fatal_note("script", clen, flags);
             fprintf(stderr,
                     "[husk-m8s] script code=%u data=%u flags=0x%x entry=0x%llx "
                     "teb=%p\n", clen, dlen, flags, (unsigned long long)entry_off,
@@ -1934,10 +2149,11 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     // without this the guest's first gs: access reads address 0x30 and the app
     // dies with no log at all (that is how this was found).
     const bool want_gs = m8a || (m8s && (g_script_flags & HUSK_SCRIPT_FLAG_TEB));
+    const char *tag = m8s ? "script" : m8b ? "m8b" : m8a ? "m8a" : "m7c";
     const int64_t rc = husk_fex_exec(
         reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA + g_script_entry,
         reinterpret_cast<uint64_t>(base), map_size, want_gs ? teb_addr : 0,
-        entry_regs);
+        entry_regs, tag);
     g_win_mode = false;
     g_code_base = 0;
     g_code_size = 0;
@@ -2034,6 +2250,8 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
 
 static int64_t husk_m7_bundle_probe(int stage) {
     g_err[0] = 0;
+    // M8f: a crash during mapping would otherwise leave no trace at all.
+    husk_fatal_install();
     if (stage == HUSK_SCRIPT) {
         // M8s: the guest program comes from Documents, not from this binary.
         char sp[4096];

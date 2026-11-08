@@ -675,6 +675,55 @@ static void husk_fatal_arm(const char *tag, uint64_t entry, uint64_t base,
     husk_fatal_note("armed", entry, gs);
 }
 
+// ---- M8i: KUSER_SHARED_DATA -----------------------------------------------
+// Every Wine ntdll syscall stub is literally
+//
+//     4c 8b d1              mov r10, rcx
+//     b8 <id>               mov eax, <syscall id>
+//     f6 04 25 08 03 fe 7f 01   test byte ptr [0x7ffe0308], 1
+//     75 03                 jne  <int 2e path, via [0x7ffe1000]>
+//     0f 05                 syscall
+//     c3                    ret
+//
+// so the FIRST thing real ntdll code does on the way to a syscall is read a
+// fixed address we never mapped: an M8f report showed exactly that --
+// `sig=11 SIGSEGV addr=0x7ffe0308`, from RtlAllocateHeap's call to
+// NtAllocateVirtualMemory. On Windows that page is KUSER_SHARED_DATA; the bit
+// picks `syscall` (0) or `int 2e` (1). Zeroing it therefore selects the path
+// our dispatcher already implements.
+//
+// Note the stub uses a 32-bit absolute displacement even in the x86-64 PE, so
+// the page has to exist at the *x86* address, not at the 0xFFFFF780... one.
+// mmap is given the address as a hint (no MAP_FIXED): if iOS already owns that
+// range the mapping lands elsewhere, and we report that instead of clobbering.
+#define HUSK_KUSER_ADDR 0x7ffe0000ull
+#define HUSK_KUSER_SIZE 0x2000ull    /* control byte at +0x308, thunk at +0x1000 */
+
+static bool husk_map_kuser_shared_data(void) {
+    static int state = 0;   /* 0 unknown, 1 mapped, -1 impossible */
+    if (state) return state > 0;
+    void *want = reinterpret_cast<void *>(HUSK_KUSER_ADDR);
+    void *p = ::mmap(want, HUSK_KUSER_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        set_err("M8i: mmap for KUSER_SHARED_DATA failed");
+        state = -1;
+        return false;
+    }
+    if (p != want) {
+        ::munmap(p, HUSK_KUSER_SIZE);
+        set_err("M8i: 0x%llx is already occupied; ntdll syscall stubs cannot run",
+                (unsigned long long)HUSK_KUSER_ADDR);
+        state = -1;
+        return false;
+    }
+    memset(p, 0, HUSK_KUSER_SIZE);
+    // bit0 == 0 -> every stub takes the `syscall` branch.
+    husk_pe_trace("m8i-kuser", HUSK_KUSER_ADDR, HUSK_KUSER_SIZE);
+    state = 1;
+    return true;
+}
+
 // ---- M8b: guest virtual memory served by our own dispatcher ----------------
 // The guest asks the Windows way (NtAllocateVirtualMemory / NtFreeVirtualMemory)
 // and we satisfy it with mmap/munmap on the same address space. This is the
@@ -834,6 +883,9 @@ static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
     *(--sp) = 0; // argc
     const uint64_t start_sp = reinterpret_cast<uint64_t>(sp);
 
+    // M8i: the page every ntdll syscall stub consults. Cheap, idempotent, and
+    // without it any real ntdll function dies on its first Nt* call.
+    (void)husk_map_kuser_shared_data();
     husk_pe_trace("before-create", entry, start_sp);
     auto *thread = g_ctx->CreateThread(entry, start_sp);
     husk_pe_trace("after-create", reinterpret_cast<uint64_t>(thread), 0);

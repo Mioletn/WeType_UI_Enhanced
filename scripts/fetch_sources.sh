@@ -58,9 +58,22 @@ unpack() {
     touch "$stamp"
 }
 
+# Three passes, 45 s apart. GitHub's release CDN answers 504 for every asset
+# during an outage (2026-11-08: five retries in a row for libffi and qemu), and
+# the outage is shorter than a build -- but it outlives one fetch() call. The
+# tarballs that DID arrive are skipped by the second pass, so a round only
+# spends time on what is still missing.
 rc=0
-for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC"; do
-    fetch "$u" || rc=1
+for round in 1 2 3; do
+    rc=0
+    for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC"; do
+        fetch "$u" || rc=1
+    done
+    [ $rc -eq 0 ] && break
+    if [ $round -lt 3 ]; then
+        echo "[wait] round $round failed; retrying in 45s"
+        sleep 45
+    fi
 done
 for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC"; do
     unpack "$u" || rc=1

@@ -55,6 +55,7 @@
 #include <csetjmp>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unistd.h>
@@ -544,8 +545,16 @@ static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
 // CPUState::gs_cached to every gs: operand, so this is all a TEB needs.
 // Pass 0 to leave gs alone (M5/M6/M7c touch no segment).
 // ---------------------------------------------------------------------------
+// Optional initial registers for the guest program. M7c/M8a/M8b start with
+// whatever CreateThread left behind; the script harness (M8s) hands the guest a
+// scratch page and the image/TEB/PEB addresses so a script never has to guess.
+struct HuskEntryRegs {
+    uint64_t rcx, rdx, r8, r9;
+};
+
 static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
-                             uint64_t code_size, uint64_t gs_base) {
+                             uint64_t code_size, uint64_t gs_base,
+                             const HuskEntryRegs *regs) {
     g_code_base = code_base;
     g_code_size = code_size;
 
@@ -613,6 +622,14 @@ static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
         // CurrentFrame is what the JIT reads gs_cached from on every gs: op.
         thread->CurrentFrame->State.gs_cached = gs_base;
         husk_pe_trace("gs-base", gs_base, 0);
+    }
+    if (regs) {
+        auto &st = thread->CurrentFrame->State;
+        st.gregs[FEXCore::X86State::REG_RCX] = regs->rcx;
+        st.gregs[FEXCore::X86State::REG_RDX] = regs->rdx;
+        st.gregs[FEXCore::X86State::REG_R8] = regs->r8;
+        st.gregs[FEXCore::X86State::REG_R9] = regs->r9;
+        husk_pe_trace("entry-regs", regs->rcx, regs->rdx);
     }
 
     g_exit_code = -99;
@@ -753,7 +770,8 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
                   image_addr, (uint64_t)stub_len);
     husk_pe_trace("mapped", image_addr, map_size);
 
-    const int64_t rc = husk_fex_exec(image_addr + stub_rva, image_addr, map_size, 0);
+    const int64_t rc = husk_fex_exec(image_addr + stub_rva, image_addr, map_size,
+                                    0, nullptr);
     fprintf(stderr,
             "[husk-pe] image=%p map=0x%zx sections=%u entry=0x%x stub=0x%zx exit=%lld\n",
             image, map_size, (unsigned)pe.section_count, pe.entry_rva,
@@ -1116,7 +1134,7 @@ static int husk_m7_prot(uint8_t mask) {
 // not proof (the 16 KiB alignment lesson from M5). iOS only exports the
 // vm_region flavour of this query, and even that may be unavailable on some
 // builds -- callers treat "could not ask" differently from "wrong answer".
-static bool husk_m7_query_prot(void *addr, int *prot) {
+static bool husk_m7_query_prot(void *addr, int *prot, uint64_t *start = nullptr) {
     vm_address_t a = reinterpret_cast<vm_address_t>(addr);
     vm_size_t sz = 0;
     natural_t depth = 0;
@@ -1127,6 +1145,10 @@ static bool husk_m7_query_prot(void *addr, int *prot) {
         reinterpret_cast<vm_region_recurse_info_t>(&info), &cnt);
     if (kr != KERN_SUCCESS) return false;
     *prot = info.protection;
+    // vm_region_recurse_64 rounds UP to the next region when the address itself
+    // is unmapped, so a successful call does NOT mean "this page exists". The
+    // caller has to compare the returned start with the address it asked for.
+    if (start) *start = static_cast<uint64_t>(a);
     return true;
 }
 
@@ -1379,6 +1401,60 @@ static bool husk_m8b_write_stub(uint8_t *base, size_t map_size) {
 }
 
 // ---------------------------------------------------------------------------
+// M8s: data-driven probe ("script harness").
+//
+// The guest program lives in Documents/husk-script.bin, so an experiment costs
+// one SFTP push and a relaunch instead of a 20-30 minute CI build. Everything
+// the script needs arrives in registers; everything it produces comes back in a
+// scratch page that the host dumps to Documents/husk-out.bin.
+//
+// Header (little endian, 0x20 bytes):
+//   0x00 char[8] magic "HUSKSCR1"
+//   0x08 u32 version (1)
+//   0x0C u32 flags   bit0 = enable the Windows syscall dispatcher
+//                    bit1 = build TEB/PEB and set the gs base
+//   0x10 u32 code_len
+//   0x14 u32 data_len   (appended after the code)
+//   0x18 u64 entry_off  (offset inside the thunk page)
+//
+// Entry registers:
+//   rcx = scratch (64 KiB, read/write)   rdx = image base
+//   r8  = TEB (only with flags bit1)     r9  = PEB (only with flags bit1)
+//
+// The thunk page is used as-is (RX after protection), so a script must not be
+// longer than the 8 KiB SizeOfImage leaves unused.
+// ---------------------------------------------------------------------------
+#define HUSK_SCRIPT_HDR      0x20u
+#define HUSK_SCRIPT_MAX      0x2000u
+#define HUSK_OUT_DUMP        0x1000u
+#define HUSK_SCRATCH_SIZE    0x10000u
+#define HUSK_SCRIPT_FLAG_WIN 1u
+#define HUSK_SCRIPT_FLAG_TEB 2u
+
+static uint8_t *g_script = nullptr;      // whole husk-script.bin
+static size_t g_script_len = 0;
+static uint8_t *g_scratch = nullptr;     // the page handed to the script
+static uint32_t g_script_flags = 0;
+static uint64_t g_script_entry = 0;
+
+static bool husk_documents_path(const char *name, char *out, size_t cap) {
+    const char *home = getenv("HOME");
+    if (!home) return false;
+    const int k = snprintf(out, cap, "%s/Documents/%s", home, name);
+    return k > 0 && static_cast<size_t>(k) < cap;
+}
+
+static bool husk_write_documents(const char *name, const void *data, size_t n) {
+    char path[4096];
+    if (!husk_documents_path(name, path, sizeof(path))) return false;
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    const size_t w = fwrite(data, 1, n, f);
+    fclose(f);
+    return w == n;
+}
+
+// ---------------------------------------------------------------------------
 // M7c: execute code that came out of the Windows binary.
 //
 // SizeOfImage ends at 0x43e000, i.e. 8 KB before the end of page 271, so the
@@ -1539,7 +1615,7 @@ static bool husk_m7_parse(const uint8_t *d, size_t n, HuskM7PE *out) {
 // (M8a, + a TEB/PEB and the first gs:-relative ntdll call). Keeping one loader
 // for all four means the bytes M8a executes are the exact bytes M7a verified.
 enum { HUSK_M7_MAP = 0, HUSK_M7_PROTECT = 1, HUSK_M7_EXEC = 2, HUSK_M8A_TEB = 3,
-       HUSK_M8B_VMEM = 4 };
+       HUSK_M8B_VMEM = 4, HUSK_SCRIPT = 5 };
 
 static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     HuskM7PE pe{};
@@ -1737,6 +1813,37 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
             if (!husk_m8b_write_stub(base, map_size)) return -61;
             g_stub_page = reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA;
             husk_pe_trace("m8b-stub", HUSK_M7C_STUB_RVA, 0xbe);
+        } else if (stage == HUSK_SCRIPT) {
+            if (!g_script || g_script_len < HUSK_SCRIPT_HDR ||
+                memcmp(g_script, "HUSKSCR1", 8) != 0) {
+                set_err("M8s: husk-script.bin missing or bad magic (%zu bytes)",
+                        g_script_len);
+                return -70;
+            }
+            const uint32_t version = pe_rd32(g_script + 0x08);
+            const uint32_t flags = pe_rd32(g_script + 0x0C);
+            const uint32_t clen = pe_rd32(g_script + 0x10);
+            const uint32_t dlen = pe_rd32(g_script + 0x14);
+            const uint64_t entry_off = pe_rd32(g_script + 0x18);
+            if (version != 1 || !clen || clen + dlen > HUSK_SCRIPT_MAX ||
+                HUSK_SCRIPT_HDR + static_cast<size_t>(clen) + dlen > g_script_len) {
+                set_err("M8s: bad header v=%u flags=0x%x code=%u data=%u len=%zu",
+                        version, flags, clen, dlen, g_script_len);
+                return -70;
+            }
+            memcpy(base + HUSK_M7C_STUB_RVA, g_script + HUSK_SCRIPT_HDR,
+                   static_cast<size_t>(clen) + dlen);
+            g_script_flags = flags;
+            g_script_entry = entry_off;
+            if (flags & HUSK_SCRIPT_FLAG_TEB) {
+                if (!husk_m8a_make_teb(&teb_addr, &peb_addr,
+                                       reinterpret_cast<uint64_t>(base))) return -58;
+            }
+            husk_pe_trace("m8s-script", clen, dlen);
+            fprintf(stderr,
+                    "[husk-m8s] script code=%u data=%u flags=0x%x entry=0x%llx "
+                    "teb=%p\n", clen, dlen, flags, (unsigned long long)entry_off,
+                    reinterpret_cast<void *>(teb_addr));
         } else {
             if (!husk_m7c_write_stub(base, map_size)) return -55;
             husk_pe_trace("m7c-stub", HUSK_M7C_STUB_RVA, 0x62);
@@ -1799,23 +1906,62 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     }
     const bool m8a = (stage == HUSK_M8A_TEB);
     const bool m8b = (stage == HUSK_M8B_VMEM);
+    const bool m8s = (stage == HUSK_SCRIPT);
+    HuskEntryRegs regs{};
+    const HuskEntryRegs *entry_regs = nullptr;
+    if (m8s) {
+        if (!g_scratch) {
+            void *sp = ::mmap(nullptr, HUSK_SCRATCH_SIZE, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (sp == MAP_FAILED) { set_err("M8s: scratch mmap failed"); return -71; }
+            g_scratch = static_cast<uint8_t *>(sp);
+        }
+        // Zero the whole dumped window: a stale byte from a previous
+        // script would otherwise look like this run's result.
+        memset(g_scratch, 0, HUSK_OUT_DUMP);
+        regs.rcx = reinterpret_cast<uint64_t>(g_scratch);
+        regs.rdx = reinterpret_cast<uint64_t>(base);
+        regs.r8 = teb_addr;
+        regs.r9 = peb_addr;
+        entry_regs = &regs;
+    }
     // M8b terminates through NtTerminateProcess, so every syscall it makes must
-    // reach husk_win_dispatch. M7c/M8a keep the Linux exit(60) path.
-    g_win_mode = m8b;
+    // reach husk_win_dispatch. M7c/M8a keep the Linux exit(60) path; a script
+    // decides for itself with flags bit0.
+    g_win_mode = m8b || (m8s && (g_script_flags & HUSK_SCRIPT_FLAG_WIN));
     g_win_use_ws = false;
     const int64_t rc = husk_fex_exec(
-        reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA,
-        reinterpret_cast<uint64_t>(base), map_size, m8a ? teb_addr : 0);
+        reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA + g_script_entry,
+        reinterpret_cast<uint64_t>(base), map_size, m8a ? teb_addr : 0,
+        entry_regs);
     g_win_mode = false;
     g_code_base = 0;
     g_code_size = 0;
+
+    if (m8s) {
+        // Everything the script produced is in the scratch page; ship it back
+        // as a file so the next experiment needs no rebuild either.
+        const bool dumped = husk_write_documents("husk-out.bin", g_scratch,
+                                                 HUSK_OUT_DUMP);
+        husk_pe_trace("m8s-exit", static_cast<uint64_t>(rc),
+                      dumped ? 1u : 0u);
+        fprintf(stderr, "[husk-m8s] exit=%lld out=%s\n", (long long)rc,
+                dumped ? "husk-out.bin" : "(write failed)");
+        if (!dumped) {
+            set_err("M8s: could not write Documents/husk-out.bin");
+            return -72;
+        }
+        return rc;   // the script's own exit code IS the result
+    }
 
     if (m8b) {
         // The mapping must be GONE: munmap has no guest-visible status, so the
         // host checks the kernel's own view after the guest asked to free.
         int prot = 0;
+        uint64_t region_start = 0;
         const bool still = husk_m7_query_prot(
-            reinterpret_cast<void *>(g_vmem_base), &prot);
+            reinterpret_cast<void *>(g_vmem_base), &prot, &region_start) &&
+            region_start == g_vmem_base;
         fprintf(stderr,
                 "[husk-m8b] vmem rc=%lld alloc=%u pattern=%u free=%u "
                 "unmapped=%u base=0x%llx size=0x%llx\n",
@@ -1884,6 +2030,33 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
 
 static int64_t husk_m7_bundle_probe(int stage) {
     g_err[0] = 0;
+    if (stage == HUSK_SCRIPT) {
+        // M8s: the guest program comes from Documents, not from this binary.
+        char sp[4096];
+        if (!husk_documents_path("husk-script.bin", sp, sizeof(sp))) {
+            set_err("M8s: cannot locate the Documents directory"); return -73;
+        }
+        FILE *sf = fopen(sp, "rb");
+        if (!sf) { set_err("M8s: cannot open %s", sp); return -73; }
+        if (fseek(sf, 0, SEEK_END) != 0) { fclose(sf); return -73; }
+        const long sl = ftell(sf);
+        rewind(sf);
+        if (sl <= 0 || sl > (64 << 10)) {
+            fclose(sf);
+            set_err("M8s: bad script size %ld", sl);
+            return -73;
+        }
+        delete[] g_script;
+        g_script = new uint8_t[static_cast<size_t>(sl)];
+        const size_t sg = fread(g_script, 1, static_cast<size_t>(sl), sf);
+        fclose(sf);
+        if (sg != static_cast<size_t>(sl)) {
+            set_err("M8s: short read (%zu of %ld)", sg, sl);
+            return -73;
+        }
+        g_script_len = sg;
+        fprintf(stderr, "[husk-m8s] script %s (%zu bytes)\n", sp, sg);
+    }
     // ntdll.dll is pushed next to the executable by deploy_wine_probe.py;
     // it is deliberately NOT baked into the IPA (4.8 MB of build artefact).
     char path[4096];
@@ -1942,6 +2115,10 @@ int64_t husk_m8a_probe(void) {
 
 int64_t husk_m8b_probe(void) {
     return husk_m7_bundle_probe(HUSK_M8B_VMEM);
+}
+
+int64_t husk_script_probe(void) {
+    return husk_m7_bundle_probe(HUSK_SCRIPT);
 }
 
 const char *husk_m7_last_error(void) {

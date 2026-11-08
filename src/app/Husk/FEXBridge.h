@@ -114,6 +114,14 @@ int64_t husk_m8a_probe(void);
  * exits 220/221/222/223 identify which step failed. */
 int64_t husk_m8b_probe(void);
 
+/* M8s: data-driven probe. The guest program is read from
+ * Documents/husk-script.bin (32-byte header + code + data), so a new experiment
+ * costs an SFTP push and a relaunch instead of a CI build. The script receives
+ * rcx = 64 KiB scratch page, rdx = image base, r8/r9 = TEB/PEB (header flag
+ * bit1); the first 4 KiB of scratch are dumped to Documents/husk-out.bin and the
+ * probe returns the script's own exit code. */
+int64_t husk_script_probe(void);
+
 /* Human-readable reason for the last M7 failure, or NULL. */
 const char *husk_m7_last_error(void);
 

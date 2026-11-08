@@ -43,16 +43,34 @@ final class LegacyRootViewController: UITabBarController {
         let m7cMarker = (docs as NSString).appendingPathComponent("husk-m7c-probe")
         let m8aMarker = (docs as NSString).appendingPathComponent("husk-m8a-probe")
         let m8bMarker = (docs as NSString).appendingPathComponent("husk-m8b-probe")
+        let scriptMarker = (docs as NSString).appendingPathComponent("husk-script-probe")
         // Only ONE FEXCore guest program may run per launch: a second guest
         // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
         // The markers are therefore mutually exclusive, in this priority:
+        // script (guest program read from Documents/husk-script.bin) >
         // m8b (guest virtual memory via Nt*VirtualMemory) >
         // m8a (TEB/PEB + gs-relative ntdll call) >
         // m7c (real DLL + real ntdll execution) > m7b (real DLL + page
         // protections) > m7 (real DLL map, host-only) >
         // m6b (syscall -> wineserver) > m6 (Windows syscalls) >
         // pe (Linux exit stub) > fex (M0 self-check).
-        if FileManager.default.fileExists(atPath: m8bMarker) {
+        if FileManager.default.fileExists(atPath: scriptMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M8s: the guest program is whatever Documents/husk-script.bin
+                // contains, so iterating on a thunk costs one file push and a
+                // relaunch instead of a CI build. The probe returns the
+                // script's own exit code and dumps its scratch page to
+                // Documents/husk-out.bin.
+                let sRc = husk_script_probe()
+                var sMsg = "husk-script-probe: rc=\(sRc)"
+                if sRc < 0, let sErr = husk_m7_last_error() {
+                    sMsg += " err=\(String(cString: sErr))"
+                }
+                HuskLog.log("script", sMsg)
+                let sLog = (docs as NSString).appendingPathComponent("husk-script-probe.log")
+                try? (sMsg + "\n").write(toFile: sLog, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: m8bMarker) {
             DispatchQueue.global(qos: .userInitiated).async {
                 // M8b: the guest allocates 64 KiB through NtAllocateVirtualMemory
                 // (id 24, six args -> two on the stack), writes pattern bytes,

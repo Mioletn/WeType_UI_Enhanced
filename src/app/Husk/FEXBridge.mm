@@ -726,6 +726,12 @@ static void husk_fatal_arm(const char *tag, uint64_t entry, uint64_t base,
 struct HuskRes {
     uint64_t base, size;
     uint32_t used;
+    uint32_t inline_; // loader-structure block: MEM_RELEASE succeeds and drops
+                      // the entry, but the host mapping stays. The M9a params
+                      // block lives INSIDE the PEB page (PEB+0x600..+0x900);
+                      // munmap() rounds up to whole pages, so unmapping "just
+                      // the params" would take the PEB and the loader list
+                      // with it -- the very crash this table exists to stop.
 };
 enum { HUSK_RES_N = 64 };
 static HuskRes g_res[HUSK_RES_N];
@@ -736,7 +742,19 @@ static void husk_res_add(uint64_t base, uint64_t size) {
         g_res[i].base = base;
         g_res[i].size = size;
         g_res[i].used = 1;
+        g_res[i].inline_ = 0;
         return;
+    }
+}
+
+// Register a block that only exists inside a larger live mapping (M9a params).
+static void husk_res_add_inline(uint64_t base, uint64_t size) {
+    husk_res_add(base, size);
+    for (int i = 0; i < HUSK_RES_N; i++) {
+        if (g_res[i].used && g_res[i].base == base) {
+            g_res[i].inline_ = 1;
+            return;
+        }
     }
 }
 
@@ -751,6 +769,16 @@ static bool husk_res_find(uint64_t addr, uint64_t *base, uint64_t *size) {
         }
     }
     return false;
+}
+
+// The reservation entry that contains `addr`, if any (for the inline flag).
+static HuskRes *husk_res_get(uint64_t addr) {
+    for (int i = 0; i < HUSK_RES_N; i++) {
+        if (!g_res[i].used) continue;
+        if (addr >= g_res[i].base && addr < g_res[i].base + g_res[i].size)
+            return &g_res[i];
+    }
+    return nullptr;
 }
 
 static void husk_res_remove(uint64_t base) {
@@ -1742,6 +1770,24 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
             base = rstart;
             size = rsize;
         }
+        // Inline reservation (M9a params inside the PEB page): the release
+        // must SUCCEED -- init_user_process_params() frees the hand-built
+        // block with the whole-reservation form and builds a new one -- but
+        // nothing may be unmapped. A decommit of the range is a no-op for the
+        // same reason. This is the exact call that used to return
+        // 0xC000000D and drop the loader at pc=0.
+        if (HuskRes *r = husk_res_get(base)) {
+            if (r->inline_) {
+                husk_pe_trace(release ? "m9a-params-free" : "m9a-params-decommit",
+                              base, size);
+                fprintf(stderr,
+                        "[husk-m9a] inline %s base=0x%llx size=0x%llx kept\n",
+                        release ? "release" : "decommit",
+                        (unsigned long long)base, (unsigned long long)size);
+                if (release) husk_res_remove(r->base);
+                return 0x00000000ULL;
+            }
+        }
         if (release) husk_res_remove(base);
         // MEM_RELEASE == 0x8000, MEM_DECOMMIT == 0x4000, and they are NOT the
         // same operation. This used to munmap() both, which is fatal for the
@@ -2090,6 +2136,13 @@ static void husk_m9a_make_params(uint8_t *peb, uint64_t image_base) {
     const uint64_t params = base + HUSK_M9A_OFF_PARAMS;
     memcpy(peb + HUSK_M9A_PEB_PARAMS, &params, 8);
     husk_pe_trace("m9a-params", params, 0);
+    // Wine's init_user_process_params() later releases this block with the
+    // whole-reservation form (MEM_RELEASE, *RegionSize == 0). It is inline in
+    // the PEB page, so register the whole hand-built span -- params struct
+    // plus the two string buffers -- as an inline reservation: the release
+    // then resolves here and keeps the page mapped (see husk_res_add_inline).
+    husk_res_add_inline(base + HUSK_M9A_OFF_PARAMS,
+                        (HUSK_M9A_OFF_DLLBUF + 0x80u) - HUSK_M9A_OFF_PARAMS);
 }
 
 // ---- M9: a loader list the guest can walk ---------------------------------

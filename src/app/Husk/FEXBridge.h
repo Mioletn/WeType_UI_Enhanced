@@ -73,6 +73,18 @@ int64_t husk_m6b_probe(void);
 /* Human-readable reason for the last M6 failure, or NULL. */
 const char *husk_m6_last_error(void);
 
+/* M7a: lay out the REAL Wine ntdll.dll in this process -- copy all 19
+ * sections, apply its 192 base relocations, resolve its 1466 named exports
+ * and report 16 KB page-permission conflicts. This is a pure host-side PE
+ * loader probe: it creates NO FEXCore guest thread and needs no TEB/PEB, so
+ * it cannot regress the M0-M6b probes. ntdll.dll is pushed next to the
+ * executable by deploy_wine_probe.py, not baked into the IPA. Returns 42 on
+ * success, a negative setup/parse error otherwise. */
+int64_t husk_m7_probe(void);
+
+/* Human-readable reason for the last M7 failure, or NULL. */
+const char *husk_m7_last_error(void);
+
 #ifdef __cplusplus
 }
 #endif

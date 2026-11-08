@@ -858,3 +858,316 @@ int64_t husk_m6b_probe(void) {
 const char *husk_m6_last_error(void) {
     return g_err[0] ? g_err : nullptr;
 }
+
+// ---------------------------------------------------------------------------
+// M7a: load the REAL Wine ntdll.dll -- sections, relocations, exports.
+//
+// Deliberately HOST-SIDE ONLY: no FEXCore guest thread, no TEB/PEB, no
+// LdrInitializeThunk. M5/M6 proved that a freestanding 5.7 KB PE can be
+// mapped and executed; they said nothing about a 4.8 MB Windows DLL with 19
+// sections, 192 base relocations and 1466 exports. This probe lays that image
+// out in this process and checks that every structure resolves consistently.
+//
+// It also MEASURES the structural problem M7b must solve: sections are 4 KB
+// aligned while the device page size is 16 KB, so mprotect() cannot give each
+// section its exact RX/RW/R permission. We report the number of 16 KB pages
+// that need both X and W, without treating it as a probe failure.
+//
+// The expected constants come from m7_loader_spec.json; check_m7.py asserts
+// they still match the real DLL, so a stale image cannot silently pass.
+// ---------------------------------------------------------------------------
+#define HUSK_M7_PAGE           0x4000u
+#define HUSK_M7_MAX_PAGES      1200u
+#define HUSK_M7_IMAGE_BASE     0x170000000ULL
+#define HUSK_M7_SIZE_IMAGE     0x43e000u
+#define HUSK_M7_SECTIONS       19u
+#define HUSK_M7_DIR64          189u
+#define HUSK_M7_RELOC_PAD      3u
+#define HUSK_M7_RELOC_BLOCKS   12u
+#define HUSK_M7_EXPORTS        1466u
+#define HUSK_M7_LDR_INIT_RVA   0x15b00u
+#define HUSK_M7_DISPATCH_RVA   0xa7068u
+
+struct HuskM7PE {
+    uint64_t image_base;
+    uint32_t size_of_image;
+    uint32_t size_of_headers;
+    uint16_t section_count;
+    const uint8_t *sections;
+    uint32_t reloc_rva, reloc_size;
+    uint32_t export_rva, export_size;
+    uint32_t exception_size;
+};
+
+struct HuskM7Mapping {
+    void *p;
+    size_t n;
+    ~HuskM7Mapping() {
+        if (p && p != MAP_FAILED) ::munmap(p, n);
+    }
+};
+
+// Owned by the fixture too: compare a NUL-terminated name inside the mapped
+// image against a literal without pulling in strcmp/memcmp declarations.
+static bool husk_m7_name_eq(const uint8_t *base, uint32_t limit,
+                            uint32_t rva, const char *want) {
+    if (rva >= limit) return false;
+    const uint8_t *s = base + rva;
+    for (uint32_t i = 0; i < 256; i++) {
+        if (rva + i >= limit) return false;
+        const char c = static_cast<char>(s[i]);
+        if (c != want[i]) return false;
+        if (c == 0) return true;
+    }
+    return false;
+}
+
+static bool husk_m7_parse(const uint8_t *d, size_t n, HuskM7PE *out) {
+    if (n < 0x40 || d[0] != 'M' || d[1] != 'Z') {
+        set_err("M7: no MZ signature"); return false;
+    }
+    const uint32_t pe = pe_rd32(d + 0x3c);
+    const uint16_t machine = pe_rd16(d + pe + 4);
+    const uint16_t nsec = pe_rd16(d + pe + 6);
+    const uint16_t optsz = pe_rd16(d + pe + 20);
+    if (pe > n || n - pe < 24 || pe_rd32(d + pe) != 0x00004550u || machine != 0x8664) {
+        set_err("M7: not a PE32+ x86-64 image"); return false;
+    }
+    if (optsz < 112 || (uint64_t)pe + 24 + optsz + (uint64_t)nsec * 40 > n) {
+        set_err("M7: truncated optional/section headers"); return false;
+    }
+    const uint8_t *opt = d + pe + 24;
+    const uint32_t ndirs = pe_rd32(opt + 108);
+    if (ndirs < 6) { set_err("M7: too few data directories"); return false; }
+    const uint8_t *dirs = opt + 112;
+
+    out->image_base = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        out->image_base |= (uint64_t)opt[24 + i] << (8 * i);
+    }
+    out->size_of_image = pe_rd32(opt + 56);
+    out->size_of_headers = pe_rd32(opt + 60);
+    out->section_count = nsec;
+    out->sections = opt + optsz;
+    out->export_rva = pe_rd32(dirs + 0);
+    out->export_size = pe_rd32(dirs + 4);
+    out->reloc_rva = pe_rd32(dirs + 8 * 5);
+    out->reloc_size = pe_rd32(dirs + 8 * 5 + 4);
+    out->exception_size = pe_rd32(dirs + 8 * 3 + 4);
+    if (!out->size_of_image || out->size_of_headers > n ||
+        out->size_of_headers > out->size_of_image ||
+        out->size_of_image / HUSK_M7_PAGE >= HUSK_M7_MAX_PAGES) {
+        set_err("M7: bad image geometry (soi=0x%x sh=0x%x)",
+                out->size_of_image, out->size_of_headers);
+        return false;
+    }
+    return true;
+}
+
+static int64_t husk_m7_load(const uint8_t *file, size_t n) {
+    HuskM7PE pe{};
+    if (!husk_m7_parse(file, n, &pe)) return -41;
+
+    // A wrong image (or a stale expected constant) must fail loudly.
+    if (pe.image_base != HUSK_M7_IMAGE_BASE || pe.size_of_image != HUSK_M7_SIZE_IMAGE ||
+        pe.section_count != HUSK_M7_SECTIONS) {
+        set_err("M7: unexpected PE geometry base=0x%llx soi=0x%x sec=%u",
+                (unsigned long long)pe.image_base, pe.size_of_image,
+                (unsigned)pe.section_count);
+        return -42;
+    }
+
+    const size_t map_size =
+        (pe.size_of_image + HUSK_M7_PAGE - 1) & ~(size_t)(HUSK_M7_PAGE - 1);
+    HuskM7Mapping map{};
+    map.p = ::mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    map.n = map_size;
+    if (map.p == MAP_FAILED) { set_err("M7: image mmap failed"); return -43; }
+    uint8_t *base = static_cast<uint8_t *>(map.p);
+
+    memcpy(base, file, pe.size_of_headers);
+    uint8_t perms[HUSK_M7_MAX_PAGES];
+    memset(perms, 0, sizeof(perms));
+
+    uint32_t copied = 0;
+    for (uint16_t i = 0; i < pe.section_count; i++) {
+        const uint8_t *s = pe.sections + (size_t)i * 40;
+        const uint32_t va = pe_rd32(s + 12);
+        const uint32_t vsize = pe_rd32(s + 8);
+        const uint32_t rawsize = pe_rd32(s + 16);
+        const uint32_t raw = pe_rd32(s + 20);
+        const uint32_t chars = pe_rd32(s + 36);
+        if (!rawsize) continue;
+        if ((uint64_t)va + rawsize > pe.size_of_image ||
+            (uint64_t)raw + rawsize > n) {
+            set_err("M7: section %u out of range (va=0x%x raw=0x%x size=0x%x)",
+                    (unsigned)i, va, raw, rawsize);
+            return -44;
+        }
+        memcpy(base + va, file + raw, rawsize);
+        copied++;
+
+        // Fold the section's required permissions into every 16 KB page it
+        // touches. bit0 = needs X, bit1 = needs W.
+        const uint32_t span = vsize > rawsize ? vsize : rawsize;
+        const uint32_t first = va / HUSK_M7_PAGE;
+        const uint32_t last = (va + span + HUSK_M7_PAGE - 1) / HUSK_M7_PAGE;
+        uint8_t mask = 0;
+        if (chars & 0x20000000u) mask |= 1u;  // IMAGE_SCN_MEM_EXECUTE
+        if (chars & 0x80000000u) mask |= 2u;  // IMAGE_SCN_MEM_WRITE
+        for (uint32_t pg = first; pg < last && pg < HUSK_M7_MAX_PAGES; pg++) {
+            perms[pg] |= mask;
+        }
+    }
+    if (copied != pe.section_count - 1) {
+        // Exactly one section (.bss) has no raw data in this image.
+        set_err("M7: unexpected section-copy count %u", copied);
+        return -45;
+    }
+
+    uint32_t mixed_pages = 0;
+    for (uint32_t pg = 0; pg < map_size / HUSK_M7_PAGE; pg++) {
+        if (perms[pg] == 3u) mixed_pages++;
+    }
+    husk_pe_trace("m7-sections", copied, mixed_pages);
+
+    // ---- base relocations -------------------------------------------------
+    // delta is the difference between where the image actually landed and the
+    // ImageBase the linker assumed. DIR64 (type 10) entries hold absolute
+    // 64-bit pointers that must be rebased; type 0 is alignment padding.
+    const uint64_t delta = (uint64_t)base - pe.image_base;
+    uint32_t dir64 = 0, pad = 0, blocks = 0;
+    uint32_t r = pe.reloc_rva;
+    const uint32_t rend = r + pe.reloc_size;
+    if (rend > pe.size_of_image) { set_err("M7: reloc directory out of image"); return -46; }
+    while (r + 8 <= rend) {
+        const uint32_t page = pe_rd32(base + r);
+        const uint32_t blocksz = pe_rd32(base + r + 4);
+        if (blocksz < 8 || (blocksz & 1) || r + blocksz > rend) {
+            set_err("M7: bad reloc block at rva=0x%x size=0x%x", r, blocksz);
+            return -47;
+        }
+        blocks++;
+        for (uint32_t j = 8; j + 2 <= blocksz; j += 2) {
+            const uint16_t w = pe_rd16(base + r + j);
+            const uint16_t type = w >> 12;
+            const uint32_t off = page + (w & 0xfffu);
+            if (type == 0) { pad++; continue; }
+            if (type != 10) {
+                set_err("M7: unsupported reloc type %u", (unsigned)type);
+                return -48;
+            }
+            if (off + 8 > pe.size_of_image) {
+                set_err("M7: DIR64 target 0x%x outside image", off);
+                return -49;
+            }
+            uint64_t old = 0, fixed = 0;
+            memcpy(&old, base + off, 8);
+            fixed = old + delta;
+            memcpy(base + off, &fixed, 8);
+            uint64_t readback = 0;
+            memcpy(&readback, base + off, 8);
+            if (readback != fixed) {
+                set_err("M7: DIR64 write-back mismatch at 0x%x", off);
+                return -50;
+            }
+            dir64++;
+        }
+        r += blocksz;
+    }
+    if (dir64 != HUSK_M7_DIR64 || pad != HUSK_M7_RELOC_PAD ||
+        blocks != HUSK_M7_RELOC_BLOCKS) {
+        set_err("M7: reloc count mismatch dir64=%u pad=%u blocks=%u",
+                dir64, pad, blocks);
+        return -51;
+    }
+    husk_pe_trace("m7-reloc", dir64, delta);
+
+    // ---- exports ----------------------------------------------------------
+    const uint8_t *ed = base + pe.export_rva;
+    const uint32_t nfun = pe_rd32(ed + 20);
+    const uint32_t nname = pe_rd32(ed + 24);
+    const uint32_t afun = pe_rd32(ed + 28);
+    const uint32_t aname = pe_rd32(ed + 32);
+    const uint32_t aord = pe_rd32(ed + 36);
+    if (nfun != HUSK_M7_EXPORTS || nname != HUSK_M7_EXPORTS) {
+        set_err("M7: export count mismatch fun=%u named=%u", nfun, nname);
+        return -52;
+    }
+    uint32_t ldr_rva = 0, disp_rva = 0, hits = 0;
+    for (uint32_t i = 0; i < nname; i++) {
+        const uint32_t name_rva = pe_rd32(base + aname + 4 * i);
+        const uint16_t ord = pe_rd16(base + aord + 2 * i);
+        const uint32_t fun_rva = pe_rd32(base + afun + 4 * (uint32_t)ord);
+        if (husk_m7_name_eq(base, pe.size_of_image, name_rva, "LdrInitializeThunk")) {
+            ldr_rva = fun_rva; hits++;
+        } else if (husk_m7_name_eq(base, pe.size_of_image, name_rva,
+                                   "__wine_syscall_dispatcher")) {
+            disp_rva = fun_rva; hits++;
+        }
+    }
+    if (hits != 2 || ldr_rva != HUSK_M7_LDR_INIT_RVA ||
+        disp_rva != HUSK_M7_DISPATCH_RVA) {
+        set_err("M7: export lookup mismatch hits=%u ldr=0x%x disp=0x%x",
+                hits, ldr_rva, disp_rva);
+        return -53;
+    }
+    husk_pe_trace("m7-exports", nname, ldr_rva);
+    husk_pe_trace("m7-exceptions", pe.exception_size / 12, disp_rva);
+
+    fprintf(stderr,
+            "[husk-m7] image=%p map=0x%zx delta=0x%llx sections=%u "
+            "reloc=%u/%u blocks=%u exports=%u ldr=0x%x disp=0x%x "
+            "mixed16k=%u unwind=%u rc=42\n",
+            base, map_size, (unsigned long long)delta, copied, dir64, pad,
+            blocks, nname, ldr_rva, disp_rva, mixed_pages,
+            pe.exception_size / 12);
+    return 42;
+}
+
+int64_t husk_m7_probe(void) {
+    g_err[0] = 0;
+    // ntdll.dll is pushed next to the executable by deploy_wine_probe.py;
+    // it is deliberately NOT baked into the IPA (4.8 MB of build artefact).
+    char path[4096];
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) != 0) {
+        set_err("M7: executable path too long"); return -1;
+    }
+    const char *slash = strrchr(path, '/');
+    if (!slash) { set_err("M7: bad executable path"); return -1; }
+    const size_t prefix = static_cast<size_t>(slash - path) + 1;
+    static const char res[] = "ntdll.dll";
+    if (prefix + sizeof(res) > sizeof(path)) {
+        set_err("M7: bundle path too long"); return -1;
+    }
+    memcpy(path + prefix, res, sizeof(res));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { set_err("M7: cannot open %s", path); return -2; }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f); set_err("M7: fseek failed"); return -3;
+    }
+    const long n = ftell(f);
+    if (n <= 0 || n > (16 << 20)) {
+        fclose(f); set_err("M7: bad image size %ld", n); return -3;
+    }
+    rewind(f);
+    uint8_t *buf = new uint8_t[(size_t)n];
+    const size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) {
+        delete[] buf;
+        set_err("M7: short read (%zu of %ld)", got, n);
+        return -4;
+    }
+    fprintf(stderr, "[husk-m7] bundle image %s (%zu bytes)\n", path, got);
+    const int64_t rc = husk_m7_load(buf, got);
+    delete[] buf;
+    return rc;
+}
+
+const char *husk_m7_last_error(void) {
+    return g_err[0] ? g_err : nullptr;
+}

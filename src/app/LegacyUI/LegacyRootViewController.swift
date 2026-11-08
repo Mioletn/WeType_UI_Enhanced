@@ -38,12 +38,27 @@ final class LegacyRootViewController: UITabBarController {
         let peMarker = (docs as NSString).appendingPathComponent("husk-pe-probe")
         let m6Marker = (docs as NSString).appendingPathComponent("husk-m6-probe")
         let m6bMarker = (docs as NSString).appendingPathComponent("husk-m6b-probe")
+        let m7Marker = (docs as NSString).appendingPathComponent("husk-m7-probe")
         // Only ONE FEXCore guest program may run per launch: a second guest
         // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
         // The markers are therefore mutually exclusive, in this priority:
-        // m6b (syscall -> wineserver) > m6 (Windows syscalls) >
-        // pe (Linux exit stub) > fex (M0 self-check).
-        if FileManager.default.fileExists(atPath: m6bMarker) {
+        // m7 (real DLL map, host-only) > m6b (syscall -> wineserver) >
+        // m6 (Windows syscalls) > pe (Linux exit stub) > fex (M0 self-check).
+        if FileManager.default.fileExists(atPath: m7Marker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M7a is pure host-side PE loading: no FEXCore guest thread,
+                // no TEB/PEB, so it cannot consume this launch's single JIT
+                // region. It lays out the real 4.8 MB Wine ntdll.dll.
+                let m7Rc = husk_m7_probe()
+                var m7Msg = "husk-m7-probe: rc=\(m7Rc)"
+                if m7Rc != 42, let m7Err = husk_m7_last_error() {
+                    m7Msg += " err=\(String(cString: m7Err))"
+                }
+                HuskLog.log("m7", m7Msg)
+                let m7Log = (docs as NSString).appendingPathComponent("husk-m7-probe.log")
+                try? (m7Msg + "\n").write(toFile: m7Log, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: m6bMarker) {
             DispatchQueue.global(qos: .userInitiated).async {
                 // M6b needs the wineserver request channel BEFORE the guest
                 // thread is created. husk_ws_start() is synchronous (socket

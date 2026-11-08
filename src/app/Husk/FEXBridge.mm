@@ -1968,6 +1968,111 @@ static bool husk_m7_protect(uint8_t *base, size_t map_size, const uint8_t *perms
 #define HUSK_M8A_SLOT_PEB   0x60u   /* thunk page: expected PEB pointer */
 #define HUSK_M8A_SLOT_IMG   0x68u   /* thunk page: expected image base */
 
+// ---- M9: a loader list the guest can walk ---------------------------------
+// PEB->Ldr is the root of everything the Windows loader is: LdrInitializeThunk
+// walks it, LdrGetDllHandle searches it, and every later import or module
+// lookup starts there. Until now PEB+0x18 was zero, which is exactly what the
+// M9 probe reported (exit 71: "PEB->Ldr is NULL").
+//
+// The list is built HERE rather than by LdrInitializeThunk, because what the
+// loader would build is known ahead of time: one LDR_DATA_TABLE_ENTRY, for
+// ntdll, linked into the three load-order lists of one PEB_LDR_DATA. That is
+// the shape Wine's LdrpFindLoadedDllByName walks (Flink from
+// LDR_DATA_TABLE_ENTRY.InLoadOrderLinks until it returns to the head), so the
+// probe can follow the same path and count modules.
+//
+// Offsets are the Windows x64 ones from Wine's include/winternl.h at the
+// commit that builds this ntdll (9129e968):
+//     PEB_LDR_DATA            InLoadOrderModuleList  +0x10
+//     LDR_DATA_TABLE_ENTRY    InLoadOrderLinks       +0x00
+//                             DllBase                +0x30
+//                             EntryPoint             +0x38
+//                             SizeOfImage            +0x40
+//                             FullDllName            +0x48
+//                             BaseDllName            +0x58
+//                             Flags                  +0x68
+//                             LoadCount              +0x6c
+#define HUSK_M9_PEB_LDR      0x18u   /* PEB.LdrData */
+#define HUSK_M9_LDR_HEAD     0x10u   /* PEB_LDR_DATA.InLoadOrderModuleList */
+#define HUSK_M9_ENT_INLOAD   0x00u
+#define HUSK_M9_ENT_INMEM    0x10u
+#define HUSK_M9_ENT_ININIT   0x20u
+#define HUSK_M9_ENT_DLLBASE  0x30u
+#define HUSK_M9_ENT_ENTRY    0x38u
+#define HUSK_M9_ENT_SIZE     0x40u
+#define HUSK_M9_ENT_FULL     0x48u
+#define HUSK_M9_ENT_BASE     0x58u
+#define HUSK_M9_ENT_FLAGS    0x68u
+#define HUSK_M9_ENT_LOADCNT  0x6cu
+#define HUSK_M9_OFF_LDR      0x200u  /* PEB_LDR_DATA lives here in the PEB page */
+#define HUSK_M9_OFF_ENTRY    0x300u  /* and the ntdll LDR_DATA_TABLE_ENTRY here */
+#define HUSK_M9_OFF_FULL     0x500u  /* FullDllName buffer */
+#define HUSK_M9_OFF_BASE     0x580u  /* BaseDllName buffer */
+
+// Link one list head to one list link, so head <-> entry is a two-node ring.
+static void husk_m9_link(uint8_t *peb, uint32_t head_off, uint32_t link_off) {
+    uint64_t head = reinterpret_cast<uint64_t>(peb) + head_off;
+    uint64_t link = reinterpret_cast<uint64_t>(peb) + link_off;
+    memcpy(peb + head_off, &link, 8);             // head.Flink
+    memcpy(peb + head_off + 8, &link, 8);         // head.Blink
+    memcpy(peb + link_off, &head, 8);             // link.Flink
+    memcpy(peb + link_off + 8, &head, 8);         // link.Blink
+}
+
+// Build PEB_LDR_DATA + one LDR_DATA_TABLE_ENTRY (ntdll) inside the PEB page.
+// The page is 16 KiB and the structures together need under 1 KiB, so nothing
+// is allocated separately: the loader list lives with the PEB it is anchored
+// in, and a guest that reads one can read the other.
+static void husk_m9_make_ldr(uint8_t *peb, uint64_t image_base) {
+    memset(peb + HUSK_M9_OFF_LDR, 0, 0x400);
+
+    // PEB_LDR_DATA: Length and Initialized are the only fields a walk reads.
+    const uint32_t ldr_len = 0x58;
+    memcpy(peb + HUSK_M9_OFF_LDR, &ldr_len, 4);
+    peb[HUSK_M9_OFF_LDR + 4] = 1;   /* Initialized */
+
+    // The ntdll entry.
+    uint8_t *e = peb + HUSK_M9_OFF_ENTRY;
+    memcpy(e + HUSK_M9_ENT_DLLBASE, &image_base, 8);
+    const uint64_t entry_point = image_base + HUSK_M7_LDR_INIT_RVA;   /* unused by a walk */
+    memcpy(e + HUSK_M9_ENT_ENTRY, &entry_point, 8);
+    const uint32_t img_size = HUSK_M7_SIZE_IMAGE;
+    memcpy(e + HUSK_M9_ENT_SIZE, &img_size, 4);
+    const uint32_t flags = 0x00000004u | 0x00080000u;   /* LDR_IMAGE_IS_DLL | LDR_PROCESS_ATTACHED */
+    memcpy(e + HUSK_M9_ENT_FLAGS, &flags, 4);
+    const uint16_t load_count = 1;
+    memcpy(e + HUSK_M9_ENT_LOADCNT, &load_count, 2);
+
+    // UNICODE_STRINGs: Length/MaxLength are BYTE counts, Buffer is an address.
+    // Both names live in the same PEB page, so a crash report can show them.
+    const uint16_t base_bytes = 9 * 2;      /* L"ntdll.dll" */
+    const uint16_t full_bytes = 9 * 2;      /* the short name, in both fields */
+    uint16_t u16;
+    const uint64_t base_buf = reinterpret_cast<uint64_t>(peb) + HUSK_M9_OFF_BASE;
+    const uint64_t full_buf = reinterpret_cast<uint64_t>(peb) + HUSK_M9_OFF_FULL;
+    u16 = base_bytes; memcpy(e + HUSK_M9_ENT_BASE, &u16, 2);
+    u16 = base_bytes; memcpy(e + HUSK_M9_ENT_BASE + 2, &u16, 2);
+    memcpy(e + HUSK_M9_ENT_BASE + 8, &base_buf, 8);
+    u16 = full_bytes; memcpy(e + HUSK_M9_ENT_FULL, &u16, 2);
+    u16 = full_bytes; memcpy(e + HUSK_M9_ENT_FULL + 2, &u16, 2);
+    memcpy(e + HUSK_M9_ENT_FULL + 8, &full_buf, 8);
+    for (unsigned i = 0; i < 9; i++) {
+        const uint16_t ch = static_cast<uint16_t>(L"ntdll.dll"[i]);
+        memcpy(peb + HUSK_M9_OFF_BASE + i * 2, &ch, 2);
+        memcpy(peb + HUSK_M9_OFF_FULL + i * 2, &ch, 2);
+    }
+
+    // The three lists. A walk of any of them must terminate at its head.
+    husk_m9_link(peb, HUSK_M9_OFF_LDR + HUSK_M9_LDR_HEAD + 0x00, HUSK_M9_OFF_ENTRY + HUSK_M9_ENT_INLOAD);
+    husk_m9_link(peb, HUSK_M9_OFF_LDR + HUSK_M9_LDR_HEAD + 0x10, HUSK_M9_OFF_ENTRY + HUSK_M9_ENT_INMEM);
+    husk_m9_link(peb, HUSK_M9_OFF_LDR + HUSK_M9_LDR_HEAD + 0x20, HUSK_M9_OFF_ENTRY + HUSK_M9_ENT_ININIT);
+
+    // And the pointer the guest reads.
+    const uint64_t ldr = reinterpret_cast<uint64_t>(peb) + HUSK_M9_OFF_LDR;
+    memcpy(peb + HUSK_M9_PEB_LDR, &ldr, 8);
+    husk_pe_trace("m9-ldr", ldr, image_base);
+}
+
 static bool husk_m8a_make_teb(uint64_t *teb_out, uint64_t *peb_out,
                              uint64_t image_base) {
     constexpr size_t SZ = 0x4000;   // 16 KiB: one device page, never split
@@ -1996,6 +2101,10 @@ static bool husk_m8a_make_teb(uint64_t *teb_out, uint64_t *peb_out,
     const uint64_t canary = 0x4855534b4d384100ULL;  // "HUSKM8A\0"
     memcpy(t + 0xf0, &canary, 8);
     memcpy(p + 0xf0, &canary, 8);
+
+    // M9: give the PEB a loader list, so PEB->Ldr is walkable and the guest can
+    // ask the loader for ntdll instead of being told "nothing has been loaded".
+    husk_m9_make_ldr(p, image_base);
 
     *teb_out = taddr;
     *peb_out = paddr;

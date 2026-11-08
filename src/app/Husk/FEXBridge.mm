@@ -467,6 +467,7 @@ static char g_gw_tag[24] = "none";
 // M8n: defined with the syscall ring further down; the fatal report calls it
 // to append the transcript of what the guest was doing when it died.
 static void husk_ring_dump(const char *tag, uint32_t want);
+static void husk_vmem_dump(const char *tag, uint32_t want);
 
 // Optional trail page owned by the script harness (M8s). A script that stores a
 // step counter here leaves a record of how far it got, because the report below
@@ -619,6 +620,7 @@ static void husk_fatal_handler(int sig, siginfo_t *info, void *uctx) {
     // This is what turns "fault at heap_base-0x3ff0" into "the guest committed
     // that page at seq=N and then read it at seq=N+3".
     husk_ring_dump("fatal", 0);
+    husk_vmem_dump("fatal", 0);
 
     // And the script's own trail, if the script kept one.
     if (g_fatal_trail && g_fatal_trail_len) {
@@ -1087,7 +1089,10 @@ static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
     // A clean exit still gets a transcript tail: it is the only record of what
     // the guest asked the kernel for on a run that did NOT crash, and the heap
     // probe needs it to show the reserve/commit sequence behind its result.
-    if (g_win_mode && g_win_seq) husk_ring_dump("exit", 16);
+    if (g_win_mode && g_win_seq) {
+        husk_ring_dump("exit", 16);
+        husk_vmem_dump("exit", 12);
+    }
     ::munmap(stack, STACK_SIZE);
     return rc;
 }
@@ -1410,6 +1415,94 @@ static void husk_ring_dump(const char *tag, uint32_t want) {
     }
 }
 
+// ---- M8p: a transcript of every virtual-memory request ---------------------
+// The heap failure needs the caller's own numbers, not ours: which base it
+// asked for, whether that base was NULL, the type/protect pair, and what it got
+// back. A ring entry holds the four register arguments, which for
+// NtAllocateVirtualMemory are pointers -- that is one level of indirection too
+// few to reason about a fault at heap_base-0x8000.
+//
+// Read from the WRAPPER, not from case 24: the same code then covers allocate,
+// free and protect without touching the dispatch body, and the values are
+// captured before and after the call so a request that the guest later blames
+// can be matched with what we actually did.
+struct HuskVmemEntry {
+    uint32_t op;        // 24 / 30 / 80
+    uint32_t status;    // NTSTATUS we returned
+    uint64_t caller;    // guest return address
+    uint64_t req_base;  // *BaseAddress before the call (0 == "anywhere")
+    uint64_t req_size;  // *RegionSize before the call
+    uint64_t out_base;  // *BaseAddress after it
+    uint64_t out_size;  // *RegionSize after it
+    uint64_t type;      // Type argument (MEM_COMMIT / MEM_RESERVE ...)
+    uint64_t prot;      // Protect argument
+};
+enum { HUSK_VMEM_N = 32 };
+static HuskVmemEntry g_vmem[HUSK_VMEM_N];
+static uint32_t g_vmem_at = 0;
+static uint32_t g_vmem_count = 0;
+
+static bool husk_guest_readable(uint64_t p, size_t n) {
+    return p >= 0x10000ull && p < 0x0000800000000000ull &&
+           (p & 3) == 0 && n && n <= 8;
+}
+static uint64_t husk_guest_load64(uint64_t p) {
+    uint64_t v = 0;
+    if (husk_guest_readable(p, 8)) memcpy(&v, reinterpret_cast<const void *>(p), 8);
+    return v;
+}
+
+static HuskVmemEntry *husk_vmem_push(uint32_t op, uint64_t caller,
+                                     uint64_t req_base, uint64_t req_size,
+                                     uint64_t type, uint64_t prot) {
+    HuskVmemEntry *e = &g_vmem[g_vmem_at];
+    g_vmem_at = (g_vmem_at + 1) % HUSK_VMEM_N;
+    if (g_vmem_count < HUSK_VMEM_N) g_vmem_count++;
+    e->op = op;
+    e->status = 0xffffffffu;
+    e->caller = caller;
+    e->req_base = req_base;
+    e->req_size = req_size;
+    e->out_base = 0;
+    e->out_size = 0;
+    e->type = type;
+    e->prot = prot;
+    return e;
+}
+
+static void husk_vmem_dump(const char *tag, uint32_t want) {
+    if (!g_vmem_count) return;
+    if (!want || want > g_vmem_count) want = g_vmem_count;
+    const uint32_t first = (g_vmem_at + HUSK_VMEM_N - want) % HUSK_VMEM_N;
+    for (uint32_t i = 0; i < want; i++) {
+        const HuskVmemEntry *e = &g_vmem[(first + i) % HUSK_VMEM_N];
+        char b[256];
+        size_t at = 0;
+        at = hf_str(b, sizeof(b), at, "[husk-vmem] ");
+        at = hf_str(b, sizeof(b), at, tag);
+        at = hf_str(b, sizeof(b), at, " op=");
+        at = hf_dec(b, sizeof(b), at, static_cast<int>(e->op));
+        at = hf_str(b, sizeof(b), at, " caller=");
+        at = hf_hex(b, sizeof(b), at, e->caller);
+        at = hf_str(b, sizeof(b), at, " req_base=");
+        at = hf_hex(b, sizeof(b), at, e->req_base);
+        at = hf_str(b, sizeof(b), at, " req_size=");
+        at = hf_hex(b, sizeof(b), at, e->req_size);
+        at = hf_str(b, sizeof(b), at, " type=");
+        at = hf_hex(b, sizeof(b), at, e->type);
+        at = hf_str(b, sizeof(b), at, " prot=");
+        at = hf_hex(b, sizeof(b), at, e->prot);
+        at = hf_str(b, sizeof(b), at, " -> base=");
+        at = hf_hex(b, sizeof(b), at, e->out_base);
+        at = hf_str(b, sizeof(b), at, " size=");
+        at = hf_hex(b, sizeof(b), at, e->out_size);
+        at = hf_str(b, sizeof(b), at, " st=");
+        at = hf_hex(b, sizeof(b), at, e->status);
+        at = hf_str(b, sizeof(b), at, "\n");
+        hf_flush(b, at);
+    }
+}
+
 static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
                                        FEXCore::HLE::SyscallArguments *args,
                                        uint32_t id, uint64_t a1, uint64_t a2,
@@ -1465,7 +1558,14 @@ static uint64_t husk_win_dispatch_body(FEXCore::Core::CpuStateFrame *frame,
         // page-aligned without depending on the M7 section's constant.
         const size_t want = static_cast<size_t>((size + 0x3fffull) &
                                                 ~(uint64_t)0x3fffull);
-        const int mprot = husk_win_prot(static_cast<uint32_t>(prot));
+        int mprot = husk_win_prot(static_cast<uint32_t>(prot));
+        // Windows ignores Protect on a reserve-only call: the pages are
+        // uncommitted, and touching them is an access violation. Mapping them
+        // with the protect value (as this did) hands out memory the guest has
+        // not committed -- the exact class of mistake that makes a heap bug
+        // invisible on the device and unfindable everywhere else.
+        const bool reserve_only = (type & 0x2000ull) && !(type & 0x1000ull);
+        if (reserve_only) mprot = PROT_NONE;
         void *p = MAP_FAILED;
         if (base) {
             // A fixed address means the caller wants the range HERE: either a
@@ -1618,8 +1718,32 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         }
     }
     HuskRingEntry *e = husk_ring_push(id, rip, caller, a1, a2, a3, a4);
+
+    // The virtual-memory calls get a transcript of their own. Argument order:
+    //   24 allocate(handle, *base, zero_bits, *size, type, prot)
+    //   30 free    (handle, *base, *size, type)
+    //   80 protect (handle, *base, *size, new_prot, *old_prot)
+    HuskVmemEntry *vm = nullptr;
+    if (id == 24 || id == 30 || id == 80) {
+        const uint64_t type = (id == 24) ? husk_win_stack_arg(frame, 5)
+                             : (id == 30) ? a4 : 0;
+        const uint64_t prot = (id == 24) ? husk_win_stack_arg(frame, 6)
+                             : (id == 80) ? a4 : 0;
+        // *RegionSize is the 4th argument for allocate (a4) and the 3rd for
+        // free/protect (a3). Getting this wrong reports a "requested size" that
+        // is really a protect value, which reads as a plausible number.
+        const uint64_t size_ptr = (id == 24) ? a4 : a3;
+        vm = husk_vmem_push(id, caller, husk_guest_load64(a2),
+                            husk_guest_load64(size_ptr), type, prot);
+    }
+
     const uint64_t ret = husk_win_dispatch_body(frame, args, id, a1, a2, a3, a4);
     if (e) e->ret = ret;
+    if (vm) {
+        vm->status = static_cast<uint32_t>(ret);
+        vm->out_base = husk_guest_load64(a2);
+        vm->out_size = husk_guest_load64((id == 24) ? a4 : a3);
+    }
     return ret;
 }
 

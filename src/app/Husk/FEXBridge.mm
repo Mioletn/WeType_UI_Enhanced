@@ -1226,19 +1226,26 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
         const uint32_t rawsize = pe_rd32(s + 16);
         const uint32_t raw = pe_rd32(s + 20);
         const uint32_t chars = pe_rd32(s + 36);
-        if (!rawsize) continue;
-        if ((uint64_t)va + rawsize > pe.size_of_image ||
-            (uint64_t)raw + rawsize > n) {
-            set_err("M7: section %u out of range (va=0x%x raw=0x%x size=0x%x)",
-                    (unsigned)i, va, raw, rawsize);
-            return -44;
+        // The permission span is max(VirtualSize, SizeOfRawData) -- NOT the raw
+        // size alone. .bss has no file data but 0x109f0 bytes of writable
+        // memory, and gating this loop on `rawsize` silently dropped its five
+        // RW pages (device trace: rw=1 instead of 6). The copy below is what
+        // rawsize actually gates.
+        const uint32_t span = vsize > rawsize ? vsize : rawsize;
+        if (!span) continue;
+        if (rawsize) {
+            if ((uint64_t)va + rawsize > pe.size_of_image ||
+                (uint64_t)raw + rawsize > n) {
+                set_err("M7: section %u out of range (va=0x%x raw=0x%x size=0x%x)",
+                        (unsigned)i, va, raw, rawsize);
+                return -44;
+            }
+            memcpy(base + va, file + raw, rawsize);
+            copied++;
         }
-        memcpy(base + va, file + raw, rawsize);
-        copied++;
 
         // Fold the section's required permissions into every 16 KB page it
         // touches. bit0 = needs X, bit1 = needs W.
-        const uint32_t span = vsize > rawsize ? vsize : rawsize;
         const uint32_t first = va / HUSK_M7_PAGE;
         const uint32_t last = (va + span + HUSK_M7_PAGE - 1) / HUSK_M7_PAGE;
         uint8_t mask = 0;

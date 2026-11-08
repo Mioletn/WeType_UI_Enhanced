@@ -447,6 +447,12 @@ static volatile uint64_t g_gw_entry, g_gw_base, g_gw_size, g_gw_gs, g_gw_stack;
 static volatile int g_gw_live;
 static char g_gw_tag[24] = "none";
 
+// Optional trail page owned by the script harness (M8s). A script that stores a
+// step counter here leaves a record of how far it got, because the report below
+// survives the crash that stopped it.
+static const uint8_t *g_fatal_trail = nullptr;
+static uint32_t g_fatal_trail_len = 0;
+
 // snprintf is not async-signal-safe, so the report is formatted by hand.
 static size_t hf_str(char *b, size_t cap, size_t at, const char *s) {
     while (s && *s && at + 1 < cap) b[at++] = *s++;
@@ -469,6 +475,13 @@ static size_t hf_dec(char *b, size_t cap, size_t at, int v) {
     if (v < 0 && at + 1 < cap) b[at++] = '-';
     do { tmp[n++] = static_cast<char>('0' + u % 10u); u /= 10u; } while (u && n < 12);
     while (n && at + 1 < cap) b[at++] = tmp[--n];
+    return at;
+}
+static size_t hf_byte(char *b, size_t cap, size_t at, uint8_t v) {
+    if (at + 3 > cap) return at;
+    b[at++] = ' ';
+    b[at++] = "0123456789abcdef"[v >> 4];
+    b[at++] = "0123456789abcdef"[v & 15];
     return at;
 }
 static void hf_flush(const char *b, size_t n) {
@@ -566,7 +579,32 @@ static void husk_fatal_handler(int sig, siginfo_t *info, void *uctx) {
     at = hf_str(buf, sizeof(buf), at, " -> ");
     at = hf_str(buf, sizeof(buf), at, verdict);
     at = hf_str(buf, sizeof(buf), at, "\n");
+
+    // The opcode word at pc is what actually identifies the failure: FEXCore
+    // turns BOTH a guest `ud2` and an instruction it cannot translate into a
+    // trap, so the signal alone cannot tell them apart (verified on device --
+    // a script whose only instruction is `ud2` reports the same SIGILL shape).
+    // A `udf`-style word means FEXCore gave up on a guest instruction; a real
+    // data-processing instruction means the trap came from somewhere else.
+    at = hf_str(buf, sizeof(buf), at, "[husk-fatal] code");
+    const uint8_t *cp = reinterpret_cast<const uint8_t *>(pc);
+    if (pc) {
+        for (int i = 0; i < 8; i++) at = hf_byte(buf, sizeof(buf), at, cp[i]);
+    }
+    at = hf_str(buf, sizeof(buf), at, "\n");
     hf_flush(buf, at);
+
+    // And the script's own trail, if the script kept one.
+    if (g_fatal_trail && g_fatal_trail_len) {
+        char tb[128];
+        size_t tat = 0;
+        tat = hf_str(tb, sizeof(tb), tat, "[husk-fatal] trail");
+        for (uint32_t i = 0; i < g_fatal_trail_len && i < 32; i++) {
+            tat = hf_byte(tb, sizeof(tb), tat, g_fatal_trail[i]);
+        }
+        tat = hf_str(tb, sizeof(tb), tat, "\n");
+        hf_flush(tb, tat);
+    }
 
     // Hand it back rather than swallowing it: SIGBUS may belong to the JIT trap
     // guard (its brk must still be stepped over), and a genuine fault has to
@@ -1785,11 +1823,21 @@ static bool husk_m7_parse(const uint8_t *d, size_t n, HuskM7PE *out) {
         set_err("M7: no MZ signature"); return false;
     }
     const uint32_t pe = pe_rd32(d + 0x3c);
+    // Bounds-check the header BEFORE reading any field through `d + pe`,
+    // otherwise a truncated image makes pe_rd16() read past `n`. Deferred from
+    // M7a only to keep "workspace source == CI source == device binary" true
+    // while that build was in flight; the behaviour for a real image is
+    // identical.
+    if (pe > n || n - pe < 24 || pe_rd32(d + pe) != 0x00004550u) {
+        set_err("M7: no PE signature at 0x%x", pe); return false;
+    }
     const uint16_t machine = pe_rd16(d + pe + 4);
     const uint16_t nsec = pe_rd16(d + pe + 6);
     const uint16_t optsz = pe_rd16(d + pe + 20);
-    if (pe > n || n - pe < 24 || pe_rd32(d + pe) != 0x00004550u || machine != 0x8664) {
-        set_err("M7: not a PE32+ x86-64 image"); return false;
+    if (machine != 0x8664) {
+        set_err("M7: machine 0x%x is not x86-64 (this loader is 64-bit only)",
+                (unsigned)machine);
+        return false;
     }
     if (optsz < 112 || (uint64_t)pe + 24 + optsz + (uint64_t)nsec * 40 > n) {
         set_err("M7: truncated optional/section headers"); return false;
@@ -2134,6 +2182,10 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
         // Zero the whole dumped window: a stale byte from a previous
         // script would otherwise look like this run's result.
         memset(g_scratch, 0, HUSK_OUT_DUMP);
+        // Hand the page to the fatal report so a crash still shows how far the
+        // script got -- this is the only trace that survives a signal.
+        g_fatal_trail = g_scratch;
+        g_fatal_trail_len = 32;
         regs.rcx = reinterpret_cast<uint64_t>(g_scratch);
         regs.rdx = reinterpret_cast<uint64_t>(base);
         regs.r8 = teb_addr;

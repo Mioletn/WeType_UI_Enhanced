@@ -84,7 +84,7 @@ int64_t husk_m7_probe(void);
 
 /* M7b: same layout as M7a, then hand every 16 KB page the protection its
  * sections ask for (RX / RW / R, merged into 5 mprotect ranges) and read the
- * result back with mach_vm_region_recurse. Reports whether this iOS build
+ * result back with vm_region_recurse_64. Reports whether this iOS build
  * allows PROT_EXEC on anonymous memory at all (exec_refused). Still no guest
  * thread: it cannot regress M0-M7a. Returns 42 on success. */
 int64_t husk_m7b_probe(void);

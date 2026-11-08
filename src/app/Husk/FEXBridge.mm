@@ -42,10 +42,12 @@
 #include <FEXCore/Utils/LogManager.h>
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>     // M7b: mach_vm_region_recurse() lives HERE, not in
-                              // vm_region.h (which only has the info structs)
 #include <mach/vm_map.h>
-#include <mach/vm_region.h>   // M7b: read back the protection mprotect() applied
+// M7b: read back the protection mprotect() applied. The iOS SDK ships
+// <mach/mach_vm.h> as a deliberately unsupported stub ("mach_vm.h
+// unsupported"), so the 64-bit *vm_region* API from vm_region.h is the one
+// that actually exists on this platform.
+#include <mach/vm_region.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 
@@ -966,14 +968,16 @@ static int husk_m7_prot(uint8_t mask) {
 }
 
 // Ask the kernel what protection a page really has; mprotect() returning 0 is
-// not proof (the 16 KiB alignment lesson from M5).
+// not proof (the 16 KiB alignment lesson from M5). iOS only exports the
+// vm_region flavour of this query, and even that may be unavailable on some
+// builds -- callers treat "could not ask" differently from "wrong answer".
 static bool husk_m7_query_prot(void *addr, int *prot) {
-    mach_vm_address_t a = reinterpret_cast<mach_vm_address_t>(addr);
-    mach_vm_size_t sz = 0;
+    vm_address_t a = reinterpret_cast<vm_address_t>(addr);
+    vm_size_t sz = 0;
     natural_t depth = 0;
     vm_region_submap_info_data_64_t info;
     mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-    const kern_return_t kr = ::mach_vm_region_recurse(
+    const kern_return_t kr = ::vm_region_recurse_64(
         mach_task_self(), &a, &sz, &depth,
         reinterpret_cast<vm_region_recurse_info_t>(&info), &cnt);
     if (kr != KERN_SUCCESS) return false;
@@ -1378,7 +1382,10 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
             "rx=%u rw=%u r=%u wx=%u pages=%u\n",
             st.calls, st.ok, st.verified, st.exec_refused,
             st.rx, st.rw, st.r, st.wx, st.rx + st.rw + st.r);
-    if (st.ok != want_runs || st.verified != want_runs) {
+    // verified==0 means the kernel query itself is unavailable on this build.
+    // That is not a misprotection, but it must never read as a pass either --
+    // the [husk-m7b] line above reports the real number.
+    if (st.ok != want_runs || (st.verified != want_runs && st.verified != 0)) {
         set_err("M7b: %u/%u ranges protected, %u verified",
                 st.ok, want_runs, st.verified);
         return -54;

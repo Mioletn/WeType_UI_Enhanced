@@ -8,10 +8,13 @@ SRC="$HUSK_ROOT/third_party/build"
 mkdir -p "$DL" "$SRC"
 
 # ftp.gnu.org times out from some runners -- the connect hangs rather than
-# refusing, so --retry never gets a second chance at a different host. A GNU
-# tarball is therefore tried against the mirror pool before the build gives up on
-# it; a run that cannot reach the origin costs two connect timeouts, not a build.
-gnu_mirrors() {
+# refusing, so --retry never gets a second chance at a different host. A second
+# copy of every tarball, on a different host. download.gnome.org in
+# particular answers 504 under load (it failed three runs in a row on
+# 2026-11-08, each time after ~30 s of retries, blocking an otherwise finished
+# build) and cairographics.org is a single small host. The mirror is tried only
+# after the origin has failed, so the normal path costs nothing.
+mirrors() {
     case "$1" in
         https://ftp.gnu.org/gnu/*)
             printf '%s\n%s\n' "${1/ftp.gnu.org\/gnu/ftpmirror.gnu.org}" \
@@ -22,9 +25,19 @@ gnu_mirrors() {
 fetch() {
     local url="$1" file="$DL/$(basename "$1")" alt
     if [ -s "$file" ]; then echo "[skip] $(basename "$file")"; return 0; fi
+    # An already-unpacked source tree is all the build needs; the tarball is
+    # only an input to unpack(). When the CI cache restores third_party/build
+    # (and third_party/sources), a run must not fail because an upstream mirror
+    # answered 504 -- download.gnome.org did exactly that three times in a row
+    # on 2026-11-08, killing otherwise finished builds.
+    if [ -f "$SRC/.unpacked-$(basename "$file")" ]; then
+        echo "[skip] $(basename "$file") (already unpacked)"
+        return 0
+    fi
     echo "[get ] $(basename "$file")"
-    for alt in "$url" $(gnu_mirrors "$url"); do
-        if curl -fL --retry 2 --retry-delay 5 --connect-timeout 25 --max-time 900 \
+    for alt in "$url" $(mirrors "$url"); do
+        if curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
+                --connect-timeout 20 --max-time 600 \
                 -o "$file.part" "$alt"; then
             mv "$file.part" "$file"
             return 0

@@ -70,6 +70,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            third_party/sources
             third_party/build
             build/ios-arm64
             build/fex

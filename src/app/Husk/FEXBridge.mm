@@ -697,22 +697,63 @@ static void husk_fatal_arm(const char *tag, uint64_t entry, uint64_t base,
 // mmap is given the address as a hint (no MAP_FIXED): if iOS already owns that
 // range the mapping lands elsewhere, and we report that instead of clobbering.
 #define HUSK_KUSER_ADDR 0x7ffe0000ull
-#define HUSK_KUSER_SIZE 0x2000ull    /* control byte at +0x308, thunk at +0x1000 */
+#define HUSK_KUSER_SIZE 0x4000ull    /* 16 KiB = one iOS page; the control byte
+                                        sits at +0x308, the int 2e thunk at
+                                        +0x1000 */
+
+// Is [addr, addr+len) unmapped? vm_region_recurse_64 rounds UP to the next
+// region when the address itself is unmapped, so a region that starts at or
+// after addr+len proves the range is free. (Same quirk that made M8b's
+// "unmapped" check wrong the other way round.)
+static bool husk_addr_is_free(uint64_t addr, size_t len) {
+    vm_address_t a = static_cast<vm_address_t>(addr);
+    vm_size_t sz = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    const kern_return_t kr = ::vm_region_recurse_64(
+        mach_task_self(), &a, &sz, &depth,
+        reinterpret_cast<vm_region_recurse_info_t>(&info), &cnt);
+    if (kr != KERN_SUCCESS) return true;    // nothing mapped anywhere above
+    if (a <= addr && sz && addr < a + sz) return false;   // inside a region
+    return a >= addr + len;
+}
 
 static bool husk_map_kuser_shared_data(void) {
     static int state = 0;   /* 0 unknown, 1 mapped, -1 impossible */
     if (state) return state > 0;
+
+    // Darwin treats a non-NULL address without MAP_FIXED as a hint and happily
+    // maps somewhere else (first attempt: "landed at 0x10..." -> EOF). So ask
+    // the kernel whether the range is free, and only then pin it down.
+    if (!husk_addr_is_free(HUSK_KUSER_ADDR, HUSK_KUSER_SIZE)) {
+        vm_address_t a = static_cast<vm_address_t>(HUSK_KUSER_ADDR);
+        vm_size_t sz = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        (void)::vm_region_recurse_64(mach_task_self(), &a, &sz, &depth,
+                                     reinterpret_cast<vm_region_recurse_info_t>(&info),
+                                     &cnt);
+        set_err("M8i: 0x%llx is occupied (region at 0x%llx size 0x%llx)",
+                (unsigned long long)HUSK_KUSER_ADDR,
+                (unsigned long long)a, (unsigned long long)sz);
+        state = -1;
+        return false;
+    }
+
     void *want = reinterpret_cast<void *>(HUSK_KUSER_ADDR);
     void *p = ::mmap(want, HUSK_KUSER_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (p == MAP_FAILED) {
-        set_err("M8i: mmap for KUSER_SHARED_DATA failed");
+        set_err("M8i: MAP_FIXED mmap at 0x%llx failed",
+                (unsigned long long)HUSK_KUSER_ADDR);
         state = -1;
         return false;
     }
     if (p != want) {
         ::munmap(p, HUSK_KUSER_SIZE);
-        set_err("M8i: 0x%llx is already occupied; ntdll syscall stubs cannot run",
+        set_err("M8i: mapping landed at %p, not 0x%llx", p,
                 (unsigned long long)HUSK_KUSER_ADDR);
         state = -1;
         return false;

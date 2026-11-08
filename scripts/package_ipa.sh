@@ -227,6 +227,18 @@ sign() { codesign --force --sign - --timestamp=none "$@"; }
 find "$SAPP" -name "*.dylib" -not -path "*/Frameworks/*.framework/*" | while read -r f; do sign "$f"; done
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
 for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done
+# 64-bit iOS reserves the first 4 GiB with __PAGEZERO, but the guest's ntdll
+# syscall stubs read KUSER_SHARED_DATA at 0x7ffe0308 through a 32-bit absolute
+# displacement -- an address they can only reach below 4 GiB. With the default
+# PAGEZERO that page cannot be mapped at all (mmap + MAP_FIXED both fail on the
+# device), so shrink the guard to one 64 KiB page. This MUST happen before
+# codesign: the signature covers the Mach-O header.
+EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SAPP/Info.plist" 2>/dev/null || echo Husk)"
+python3 "$HUSK_ROOT/scripts/shrink_pagezero.py" "$SAPP/$EXEC_NAME" || {
+    echo "==> could not shrink __PAGEZERO; refusing to package" >&2
+    exit 1
+}
+
 sign --entitlements "$ENT" "$SAPP"
 echo "==> entitlements in the signed app:"
 EMBEDDED_ENTS=$(codesign -d --entitlements - "$SAPP" 2>&1 || true)

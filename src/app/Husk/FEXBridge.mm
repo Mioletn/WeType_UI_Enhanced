@@ -765,6 +765,30 @@ static bool husk_map_kuser_shared_data(void) {
     return true;
 }
 
+// Fallback for when the KUSER_SHARED_DATA page cannot be mapped (it lives
+// inside our own __PAGEZERO -- 0x7ffe0000 is below the 4 GiB a 64-bit iOS app
+// reserves). The bytes below are the probe every ntdll syscall stub runs:
+//
+//     f6 04 25 08 03 fe 7f 01   test byte ptr [0x7ffe0308], 1
+//     75 03                     jne  <int 2e path>
+//
+// NOP them and the stub falls straight through to `syscall`, which is the
+// branch we implement anyway. Only executable sections are patched, so a lucky
+// byte match inside .rdata cannot corrupt data.
+static uint32_t husk_neutralize_syscall_probe(uint8_t *p, size_t n) {
+    static const uint8_t pat[10] = {0xf6, 0x04, 0x25, 0x08, 0x03,
+                                    0xfe, 0x7f, 0x01, 0x75, 0x03};
+    uint32_t hits = 0;
+    if (!p || n < sizeof(pat)) return 0;
+    for (size_t i = 0; i + sizeof(pat) <= n; i++) {
+        if (memcmp(p + i, pat, sizeof(pat)) != 0) continue;
+        memset(p + i, 0x90, sizeof(pat));
+        hits++;
+        i += sizeof(pat) - 1;
+    }
+    return hits;
+}
+
 // ---- M8b: guest virtual memory served by our own dispatcher ----------------
 // The guest asks the Windows way (NtAllocateVirtualMemory / NtFreeVirtualMemory)
 // and we satisfy it with mmap/munmap on the same address space. This is the
@@ -2014,6 +2038,11 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     uint8_t perms[HUSK_M7_MAX_PAGES];
     memset(perms, 0, sizeof(perms));
 
+    // M8i: the page the syscall stubs consult. If it cannot be mapped we patch
+    // the probe out of the executable sections instead -- see the helper above.
+    const bool kuser_ok = husk_map_kuser_shared_data();
+    uint32_t probe_fixed = 0;
+
     uint32_t copied = 0;
     for (uint16_t i = 0; i < pe.section_count; i++) {
         const uint8_t *s = pe.sections + (size_t)i * 40;
@@ -2038,6 +2067,9 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
             }
             memcpy(base + va, file + raw, rawsize);
             copied++;
+            if (!kuser_ok && (chars & 0x20000000u)) {
+                probe_fixed += husk_neutralize_syscall_probe(base + va, rawsize);
+            }
         }
 
         // Fold the section's required permissions into every 16 KB page it
@@ -2062,6 +2094,9 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
         if (perms[pg] == 3u) mixed_pages++;
     }
     husk_pe_trace("m7-sections", copied, mixed_pages);
+    // 1 in b = the real KUSER_SHARED_DATA page is mapped; 0 means the stubs had
+    // to be patched instead.
+    husk_pe_trace("m8i-probe", probe_fixed, kuser_ok ? 1u : 0u);
 
     // ---- base relocations -------------------------------------------------
     // delta is the difference between where the image actually landed and the

@@ -1930,9 +1930,13 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     // decides for itself with flags bit0.
     g_win_mode = m8b || (m8s && (g_script_flags & HUSK_SCRIPT_FLAG_WIN));
     g_win_use_ws = false;
+    // A script that asked for a TEB must actually get one as the gs base --
+    // without this the guest's first gs: access reads address 0x30 and the app
+    // dies with no log at all (that is how this was found).
+    const bool want_gs = m8a || (m8s && (g_script_flags & HUSK_SCRIPT_FLAG_TEB));
     const int64_t rc = husk_fex_exec(
         reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA + g_script_entry,
-        reinterpret_cast<uint64_t>(base), map_size, m8a ? teb_addr : 0,
+        reinterpret_cast<uint64_t>(base), map_size, want_gs ? teb_addr : 0,
         entry_regs);
     g_win_mode = false;
     g_code_base = 0;

@@ -483,9 +483,12 @@ static bool husk_parse_pe32plus(const uint8_t *d, size_t n, HuskPEHeader *out) {
 //
 // `code_base`/`code_size` is the guest range QueryGuestExecutableRange must
 // report; it must cover BOTH the entry point and every page the guest runs.
+// `gs_base` (M8a) becomes the guest's gs segment base -- FEXCore adds
+// CPUState::gs_cached to every gs: operand, so this is all a TEB needs.
+// Pass 0 to leave gs alone (M5/M6/M7c touch no segment).
 // ---------------------------------------------------------------------------
 static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
-                             uint64_t code_size) {
+                             uint64_t code_size, uint64_t gs_base) {
     g_code_base = code_base;
     g_code_size = code_size;
 
@@ -547,6 +550,12 @@ static int64_t husk_fex_exec(uint64_t entry, uint64_t code_base,
         gdt[0].Type = 0b1011;
         thread->CurrentFrame->State.segment_arrays[0] = gdt;
         thread->CurrentFrame->State.cs_idx = 0;
+    }
+    if (gs_base) {
+        // M8a: the guest's gs base. Must be set AFTER CreateThread, because
+        // CurrentFrame is what the JIT reads gs_cached from on every gs: op.
+        thread->CurrentFrame->State.gs_cached = gs_base;
+        husk_pe_trace("gs-base", gs_base, 0);
     }
 
     g_exit_code = -99;
@@ -687,7 +696,7 @@ static int64_t husk_fex_run_pe(const uint8_t *file, size_t file_size,
                   image_addr, (uint64_t)stub_len);
     husk_pe_trace("mapped", image_addr, map_size);
 
-    const int64_t rc = husk_fex_exec(image_addr + stub_rva, image_addr, map_size);
+    const int64_t rc = husk_fex_exec(image_addr + stub_rva, image_addr, map_size, 0);
     fprintf(stderr,
             "[husk-pe] image=%p map=0x%zx sections=%u entry=0x%x stub=0x%zx exit=%lld\n",
             image, map_size, (unsigned)pe.section_count, pe.entry_rva,
@@ -945,9 +954,11 @@ struct HuskM7Mapping {
 #define HUSK_M7B_RX      31u
 #define HUSK_M7B_RW       6u
 #define HUSK_M7B_R       235u
-#define HUSK_M7C_RUNS    6u    /* M7c adds one RX range for the thunk page */
+#define HUSK_M7C_RUNS    6u    /* M7c/M8a add one RX range for the thunk page */
 #define HUSK_M7C_RX      32u
 #define HUSK_M7C_R       234u
+/* Both thunks live in the 8 KiB of page 271 that SizeOfImage leaves unused. */
+#define HUSK_M7C_STUB_RVA    0x43e000u
 
 struct HuskM7Prot {
     uint32_t calls;         // mprotect() ranges issued
@@ -1030,6 +1041,118 @@ static bool husk_m7_protect(uint8_t *base, size_t map_size, const uint8_t *perms
 }
 
 // ---------------------------------------------------------------------------
+// M8a: the first guest code that needs a TEB and a PEB.
+//
+// `RtlGetCurrentPeb` (RVA 0x29140) is exactly three instructions:
+//     mov rax, qword ptr gs:[0x30]    ; NT_TIB.Self == the TEB address
+//     mov rax, qword ptr [rax+0x60]   ; TEB.ProcessEnvironmentBlock
+//     ret
+// so ONE call checks three independent things at once: FEXCore's gs segment
+// base (CPUState::gs_cached), the +0x30/+0x60 TEB layout, and that ntdll hands
+// back OUR PEB. No LdrInitializeThunk, no LdrpInitialize, no heap.
+//
+// The thunk then reads PEB->ImageBaseAddress (PEB+0x10) and compares both
+// pointers against slots filled with the real runtime addresses, so a stale or
+// cross-wired value cannot pass.
+// ---------------------------------------------------------------------------
+#define HUSK_M8A_RTLGETPEB  0x29140u
+#define HUSK_M8A_TEB_SELF   0x30u   /* NT_TIB.Self inside the x64 TEB */
+#define HUSK_M8A_TEB_PEB    0x60u   /* TEB.ProcessEnvironmentBlock */
+#define HUSK_M8A_PEB_IMAGE  0x10u   /* PEB.ImageBaseAddress */
+#define HUSK_M8A_SLOT_PEB   0x60u   /* thunk page: expected PEB pointer */
+#define HUSK_M8A_SLOT_IMG   0x68u   /* thunk page: expected image base */
+
+static bool husk_m8a_make_teb(uint64_t *teb_out, uint64_t *peb_out,
+                             uint64_t image_base) {
+    constexpr size_t SZ = 0x4000;   // 16 KiB: one device page, never split
+    void *teb = ::mmap(nullptr, SZ, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (teb == MAP_FAILED) { set_err("M8a: TEB mmap failed"); return false; }
+    void *peb = ::mmap(nullptr, SZ, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (peb == MAP_FAILED) {
+        set_err("M8a: PEB mmap failed");
+        ::munmap(teb, SZ);
+        return false;
+    }
+    uint8_t *t = static_cast<uint8_t *>(teb);
+    uint8_t *p = static_cast<uint8_t *>(peb);
+    memset(t, 0, 0x100);
+    memset(p, 0, 0x100);
+
+    const uint64_t taddr = reinterpret_cast<uint64_t>(teb);
+    const uint64_t paddr = reinterpret_cast<uint64_t>(peb);
+    memcpy(t + HUSK_M8A_TEB_SELF, &taddr, 8);
+    memcpy(t + HUSK_M8A_TEB_PEB, &paddr, 8);
+    memcpy(p + HUSK_M8A_PEB_IMAGE, &image_base, 8);
+    // A canary the guest does NOT read: if ntdll or the JIT scribbled over the
+    // structures, the host-side read-back after the run will notice.
+    const uint64_t canary = 0x4855534b4d384100ULL;  // "HUSKM8A\0"
+    memcpy(t + 0xf0, &canary, 8);
+    memcpy(p + 0xf0, &canary, 8);
+
+    *teb_out = taddr;
+    *peb_out = paddr;
+    return true;
+}
+
+static bool husk_m8a_write_stub(uint8_t *base, size_t map_size,
+                                uint64_t peb, uint64_t image_base) {
+    static const uint8_t tmpl[] = {
+        0xE8, 0, 0, 0, 0,                         // call RtlGetCurrentPeb
+        0x4C, 0x8B, 0x15, 0, 0, 0, 0,             // mov r10, [rip+slot_peb]
+        0x4C, 0x39, 0xD0,                         // cmp rax, r10
+        0x75, 0,                                  // jne fail1 (patched)
+        0x48, 0x8B, 0x40, 0x10,                   // mov rax, [rax+0x10]
+        0x4C, 0x8B, 0x15, 0, 0, 0, 0,             // mov r10, [rip+slot_image]
+        0x4C, 0x39, 0xD0,                         // cmp rax, r10
+        0x75, 0,                                  // jne fail2 (patched)
+        0xBF, 0x2A, 0x00, 0x00, 0x00,             // mov edi, 42
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05,                               // syscall
+        0x0F, 0x0B,                               // ud2 (unreachable)
+        // fail1 @0x2f: the PEB pointer itself came back wrong
+        0xBF, 0xC8, 0x00, 0x00, 0x00,             // mov edi, 200
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05,                               // syscall
+        // fail2 @0x3b: PEB->ImageBaseAddress came back wrong
+        0xBF, 0xD2, 0x00, 0x00, 0x00,             // mov edi, 210
+        0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+        0x0F, 0x05,                               // syscall
+    };
+    if ((uint64_t)HUSK_M7C_STUB_RVA + sizeof(tmpl) > map_size) {
+        set_err("M8a: thunk does not fit the tail page"); return false;
+    }
+    uint8_t *stub = base + HUSK_M7C_STUB_RVA;
+    memcpy(stub, tmpl, sizeof(tmpl));
+
+    const int64_t rtl_off =
+        (int64_t)HUSK_M8A_RTLGETPEB - (int64_t)HUSK_M7C_STUB_RVA;
+    struct Patch { uint32_t at; int64_t target; uint32_t next; };
+    const Patch patches[] = {
+        {0x01, rtl_off, 0x05},
+        {0x08, (int64_t)HUSK_M8A_SLOT_PEB, 0x0C},
+        {0x18, (int64_t)HUSK_M8A_SLOT_IMG, 0x1C},
+    };
+    for (const Patch &q : patches) {
+        const int64_t disp = q.target - (int64_t)q.next;
+        if (disp < -2147483648LL || disp > 2147483647LL) {
+            set_err("M8a: displacement out of range (0x%llx)",
+                    (unsigned long long)disp);
+            return false;
+        }
+        const int32_t d32 = static_cast<int32_t>(disp);
+        memcpy(stub + q.at, &d32, sizeof(d32));
+    }
+    stub[0x10] = static_cast<uint8_t>(0x2F - 0x11);   // jne fail1
+    stub[0x20] = static_cast<uint8_t>(0x3B - 0x21);   // jne fail2
+
+    memcpy(stub + HUSK_M8A_SLOT_PEB, &peb, 8);
+    memcpy(stub + HUSK_M8A_SLOT_IMG, &image_base, 8);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // M7c: execute code that came out of the Windows binary.
 //
 // SizeOfImage ends at 0x43e000, i.e. 8 KB before the end of page 271, so the
@@ -1047,7 +1170,6 @@ static bool husk_m7_protect(uint8_t *base, size_t map_size, const uint8_t *perms
 // on no host-provided pointer. Exit codes 100+n / 150+n report the wrong
 // answer from call 1 / call 2 instead of a bare failure.
 // ---------------------------------------------------------------------------
-#define HUSK_M7C_STUB_RVA    0x43e000u
 #define HUSK_M7C_RTLCOMPARE  0x1de80u
 #define HUSK_M7C_DATA1       0x80u
 #define HUSK_M7C_DATA2       0x90u
@@ -1187,9 +1309,10 @@ static bool husk_m7_parse(const uint8_t *d, size_t n, HuskM7PE *out) {
 }
 
 // stage: HUSK_M7_MAP (M7a, layout only), HUSK_M7_PROTECT (M7b, + real page
-// permissions), HUSK_M7_EXEC (M7c, + run real ntdll code). Keeping one loader
-// for all three means the bytes M7c executes are the exact bytes M7a verified.
-enum { HUSK_M7_MAP = 0, HUSK_M7_PROTECT = 1, HUSK_M7_EXEC = 2 };
+// permissions), HUSK_M7_EXEC (M7c, + run real ntdll code), HUSK_M8A_TEB
+// (M8a, + a TEB/PEB and the first gs:-relative ntdll call). Keeping one loader
+// for all four means the bytes M8a executes are the exact bytes M7a verified.
+enum { HUSK_M7_MAP = 0, HUSK_M7_PROTECT = 1, HUSK_M7_EXEC = 2, HUSK_M8A_TEB = 3 };
 
 static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     HuskM7PE pe{};
@@ -1364,14 +1487,29 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
         return 42;
     }
 
-    // M7c: the thunk needs an executable page, and SizeOfImage leaves 8 KiB of
-    // page 271 unused, so that page becomes RX instead of R.
-    if (stage == HUSK_M7_EXEC) {
+    // A guest entry point needs an executable page, and SizeOfImage leaves
+    // 8 KiB of page 271 unused, so that page becomes RX instead of R.
+    const bool exec_stage = (stage >= HUSK_M7_EXEC);
+    uint64_t teb_addr = 0, peb_addr = 0;
+    if (exec_stage) {
         const uint32_t stub_page = HUSK_M7C_STUB_RVA / HUSK_M7_PAGE;
         if (stub_page >= npages) { set_err("M7c: thunk page outside image"); return -55; }
         perms[stub_page] |= 1u;
-        if (!husk_m7c_write_stub(base, map_size)) return -55;
-        husk_pe_trace("m7c-stub", HUSK_M7C_STUB_RVA, 0x62);
+        if (stage == HUSK_M8A_TEB) {
+            if (!husk_m8a_make_teb(&teb_addr, &peb_addr,
+                                   reinterpret_cast<uint64_t>(base))) return -58;
+            if (!husk_m8a_write_stub(base, map_size, peb_addr,
+                                     reinterpret_cast<uint64_t>(base))) return -58;
+            husk_pe_trace("m8a-stub", HUSK_M7C_STUB_RVA, 0x47);
+            fprintf(stderr,
+                    "[husk-m8a] teb=%p peb=%p gs=teb peb_image=0x%llx\n",
+                    reinterpret_cast<void *>(teb_addr),
+                    reinterpret_cast<void *>(peb_addr),
+                    (unsigned long long)reinterpret_cast<uint64_t>(base));
+        } else {
+            if (!husk_m7c_write_stub(base, map_size)) return -55;
+            husk_pe_trace("m7c-stub", HUSK_M7C_STUB_RVA, 0x62);
+        }
     }
 
     HuskM7Prot st{};
@@ -1380,7 +1518,6 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
                 "verified=%u wx=%u", st.calls, st.ok, st.fail, st.verified, st.wx);
         return -54;
     }
-    const bool exec_stage = (stage == HUSK_M7_EXEC);
     const uint32_t want_runs = exec_stage ? HUSK_M7C_RUNS : HUSK_M7B_RUNS;
     const uint32_t want_rx = exec_stage ? HUSK_M7C_RX : HUSK_M7B_RX;
     const uint32_t want_r = exec_stage ? HUSK_M7C_R : HUSK_M7B_R;
@@ -1418,7 +1555,7 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
         return 42;
     }
 
-    // ---- M7c: run RtlCompareMemory straight out of the mapped ntdll -------
+    // ---- run the guest: M7c/RtlCompareMemory or M8a/RtlGetCurrentPeb ------
     if (!g_ctx) {
         std::lock_guard<std::mutex> lock(g_lock);
         if (!g_ctx) {
@@ -1431,11 +1568,39 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
     }
     g_win_mode = false;   // Linux exit(60) path: the guest exits through us
     g_win_use_ws = false;
+    const bool m8a = (stage == HUSK_M8A_TEB);
     const int64_t rc = husk_fex_exec(
         reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA,
-        reinterpret_cast<uint64_t>(base), map_size);
+        reinterpret_cast<uint64_t>(base), map_size, m8a ? teb_addr : 0);
     g_code_base = 0;
     g_code_size = 0;
+
+    if (m8a) {
+        // A TEB/PEB that the guest could corrupt would still "work", so verify
+        // the canaries the thunk never touches.
+        uint64_t tcan = 0, pcan = 0;
+        memcpy(&tcan, reinterpret_cast<const void *>(teb_addr + 0xf0), 8);
+        memcpy(&pcan, reinterpret_cast<const void *>(peb_addr + 0xf0), 8);
+        fprintf(stderr,
+                "[husk-m8a] rtlgetcurrentpeb exit=%lld want=42 teb_canary=%s "
+                "peb_canary=%s\n",
+                (long long)rc,
+                tcan == 0x4855534b4d384100ULL ? "ok" : "BAD",
+                pcan == 0x4855534b4d384100ULL ? "ok" : "BAD");
+        if (rc != 42) {
+            // 200 = PEB pointer wrong, 210 = PEB->ImageBaseAddress wrong.
+            set_err("M8a: RtlGetCurrentPeb path returned exit=%lld (want 42)",
+                    (long long)rc);
+            return -59;
+        }
+        if (tcan != 0x4855534b4d384100ULL || pcan != 0x4855534b4d384100ULL) {
+            set_err("M8a: guest scribbled over the TEB/PEB canary");
+            return -60;
+        }
+        fprintf(stderr, "[husk-m8a] rc=42\n");
+        return 42;
+    }
+
     fprintf(stderr,
             "[husk-m7c] rtlcompare stub=0x%x target=0x%x exit=%lld want=42\n",
             HUSK_M7C_STUB_RVA, HUSK_M7C_RTLCOMPARE, (long long)rc);
@@ -1500,6 +1665,10 @@ int64_t husk_m7b_probe(void) {
 
 int64_t husk_m7c_probe(void) {
     return husk_m7_bundle_probe(HUSK_M7_EXEC);
+}
+
+int64_t husk_m8a_probe(void) {
+    return husk_m7_bundle_probe(HUSK_M8A_TEB);
 }
 
 const char *husk_m7_last_error(void) {

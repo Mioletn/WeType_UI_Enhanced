@@ -41,14 +41,31 @@ final class LegacyRootViewController: UITabBarController {
         let m7Marker = (docs as NSString).appendingPathComponent("husk-m7-probe")
         let m7bMarker = (docs as NSString).appendingPathComponent("husk-m7b-probe")
         let m7cMarker = (docs as NSString).appendingPathComponent("husk-m7c-probe")
+        let m8aMarker = (docs as NSString).appendingPathComponent("husk-m8a-probe")
         // Only ONE FEXCore guest program may run per launch: a second guest
         // thread crashes on iOS 12.2 (SIGBUS in the second JIT code buffer).
         // The markers are therefore mutually exclusive, in this priority:
+        // m8a (TEB/PEB + gs-relative ntdll call) >
         // m7c (real DLL + real ntdll execution) > m7b (real DLL + page
         // protections) > m7 (real DLL map, host-only) >
         // m6b (syscall -> wineserver) > m6 (Windows syscalls) >
         // pe (Linux exit stub) > fex (M0 self-check).
-        if FileManager.default.fileExists(atPath: m7cMarker) {
+        if FileManager.default.fileExists(atPath: m8aMarker) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                // M8a: builds a TEB/PEB, points FEXCore's gs base at the TEB
+                // and calls ntdll's RtlGetCurrentPeb, which is literally
+                // `mov rax,gs:[0x30]; mov rax,[rax+0x60]; ret`. rc=42 means
+                // the returned PEB and its ImageBaseAddress are both ours.
+                let m8aRc = husk_m8a_probe()
+                var m8aMsg = "husk-m8a-probe: rc=\(m8aRc)"
+                if m8aRc != 42, let m8aErr = husk_m7_last_error() {
+                    m8aMsg += " err=\(String(cString: m8aErr))"
+                }
+                HuskLog.log("m8a", m8aMsg)
+                let m8aLog = (docs as NSString).appendingPathComponent("husk-m8a-probe.log")
+                try? (m8aMsg + "\n").write(toFile: m8aLog, atomically: true, encoding: .utf8)
+            }
+        } else if FileManager.default.fileExists(atPath: m7cMarker) {
             DispatchQueue.global(qos: .userInitiated).async {
                 // M7c: the first execution of REAL Windows code on this
                 // device. Loads the 4.8 MB Wine ntdll.dll, applies real page

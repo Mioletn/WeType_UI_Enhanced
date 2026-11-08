@@ -97,6 +97,15 @@ int64_t husk_m7b_probe(void);
  * error reporting the wrong answer from call 1 / call 2. */
 int64_t husk_m7c_probe(void);
 
+/* M8a: M7c plus the first gs:-relative ntdll call. Builds a minimal TEB
+ * (NT_TIB.Self at +0x30, Peb at +0x60) and PEB (ImageBaseAddress at +0x10),
+ * points FEXCore's gs base at the TEB, then calls ntdll's RtlGetCurrentPeb
+ * (RVA 0x29140: mov rax,gs:[0x30]; mov rax,[rax+0x60]; ret) and verifies it
+ * returns exactly our PEB and our image base. Still no LdrInitializeThunk.
+ * Returns 42 on success; 200/210 come back as a negative error reporting which
+ * pointer was wrong. */
+int64_t husk_m8a_probe(void);
+
 /* Human-readable reason for the last M7 failure, or NULL. */
 const char *husk_m7_last_error(void);
 

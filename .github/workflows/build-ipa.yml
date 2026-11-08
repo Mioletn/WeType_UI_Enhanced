@@ -55,6 +55,37 @@ jobs:
           test "$(xcodebuild -version | head -1 | awk '{print $2}')" = "16.4" \
             || { echo "Xcode 16.4 not selected"; exit 1; }
 
+      - name: Restore the heavy build tree
+        # Almost all of a run's 20-30 minutes is glib/pixman/libslirp/QEMU and
+        # FEXCore. Probe iterations only touch src/app/Husk/*.mm and the Swift
+        # UI, so caching the stage build trees plus build/stamps turns a
+        # one-file change into an incremental rebuild: xcodebuild recompiles
+        # FEXBridge.mm and relinks, and build_ios.sh's done_stage()/mark_stage()
+        # markers skip the heavy stages entirely.
+        #
+        # The key hashes the build scripts, so changing a stage definition (or a
+        # patch) invalidates the cache instead of silently reusing stale objects.
+        # build/java-runtime is cached separately on purpose: it comes from the
+        # Android system image, not from a compiler.
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/build
+            build/ios-arm64
+            build/fex
+            build/tools
+            build/stamps
+          key: ios12-tree-${{ hashFiles('scripts/build_ios.sh', 'scripts/build_fex_ios.sh', 'scripts/ci_build.sh', 'scripts/build_gpu_ios.sh', 'scripts/package_ipa.sh') }}
+          restore-keys: |
+            ios12-tree-
+
+      - name: Build tree size
+        # Lets us see what the cache is actually buying (and keeps the numbers
+        # honest when a stage silently stops being reused).
+        run: |
+          du -sh third_party/build build/ios-arm64 build/fex 2>/dev/null || true
+          ls build/stamps 2>/dev/null | tr '\n' ' '; echo
+
       - name: Install build dependencies
         run: |
           brew install meson ninja pkg-config cmake xcodegen qemu

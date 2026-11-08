@@ -272,7 +272,24 @@ static int64_t husk_fex_init(void) {
     }
 
     // 4. host features -- Apple A12 (iPad8,1): ARMv8.3, LSE atomics, CRC,
-    //    RCPC, no SVE.
+    //    RCPC, no SVE, NO FlagM.
+    //
+    //    FlagM/FlagM2 must stay FALSE. They are ARMv8.4, and the JIT's
+    //    CarryInvert op emits the `cfinv` instruction for them
+    //    (JIT/ALUOps.cpp: `LOGMAN_THROW_A_FMT(SupportsFlagM); cfinv();`). A12
+    //    does not implement FEAT_FlagM, so any x86 instruction that FEX lowers
+    //    through CarryInvert (adc/sbb/cmc/...) becomes an undefined instruction
+    //    and the process dies with SIGILL at the JIT pc -- which is exactly
+    //    what an M8f report showed: `sig=4 SIGILL ... code 1f 40 00 d5`
+    //    (0xD500401F = cfinv) while RtlImageNtHeader's SEH prologue ran.
+    //    With the flags false the JIT takes the portable cset/bfi path.
+    //
+    //    Everything left true below is ARMv8.0-8.3 (LSE atomics, CRC, RCPC,
+    //    AES/SHA/PMULL, FCMA). The rule for this table is simple: a flag may
+    //    only be true if the instruction it unlocks is documented for ARMv8.3,
+    //    because on this CPU anything newer is an undefined instruction, and
+    //    FEXCore deliberately emits those instructions without a runtime check
+    //    when the flag says the host has them.
     FEXCore::HostFeatures feat{};
     feat.DCacheLineSize = 128;
     feat.ICacheLineSize = 64;
@@ -281,12 +298,12 @@ static int64_t husk_fex_init(void) {
     feat.SupportsCRC = true;
     feat.SupportsAtomics = true;
     feat.SupportsRCPC = true;
-    feat.SupportsTSOImm9 = true;
+    feat.SupportsTSOImm9 = false;  // ARMv8.4 LRCPC2 (ldapur/stlur): not A12
     feat.SupportsSHA = true;
     feat.SupportsPMULL_128Bit = true;
     feat.SupportsFCMA = true;
-    feat.SupportsFlagM = true;
-    feat.SupportsFlagM2 = true;
+    feat.SupportsFlagM = false;    // ARMv8.4: cfinv/rmif are undefined on A12
+    feat.SupportsFlagM2 = false;   // ditto (axflag/xaflag)
     feat.SupportsAVX = false;
     feat.SupportsSVE128 = false;
     feat.SupportsSVE256 = false;

@@ -422,6 +422,20 @@ static uint64_t g_vmem_size = 0;
 static uint32_t g_vmem_alloc_ok = 0;
 static uint32_t g_vmem_pattern_ok = 0;
 static uint32_t g_vmem_free_ok = 0;
+static uint64_t g_stub_page = 0;      // base of the RX thunk page, if any
+static uint32_t g_win_bad_ptr = 0;    // guest asked us to write to a page we must not
+
+// The thunk page is PROT_READ|PROT_EXEC. A host memcpy into it faults and kills
+// the WHOLE app with no guest-exit trace and no .ips -- exactly what happened on
+// the first M8b run, where the result slots lived in that page. Refuse instead.
+static bool husk_win_ptr_ok(uint64_t p, size_t n) {
+    if (!p || !n) return false;
+    if (g_stub_page && p >= g_stub_page && p + n <= g_stub_page + 0x4000ull) {
+        g_win_bad_ptr = 1;
+        return false;
+    }
+    return true;
+}
 
 // Windows x64 passes syscall argument N>=5 on the stack at
 // [rsp + 0x28 + 8*(N-5)] (return address + 32-byte shadow space). FEXCore
@@ -907,8 +921,11 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         const uint64_t type = husk_win_stack_arg(frame, 5);
         const uint64_t prot = husk_win_stack_arg(frame, 6);
         uint64_t base = 0, size = 0;
-        if (a2) memcpy(&base, reinterpret_cast<const void *>(a2), 8);
-        if (a4) memcpy(&size, reinterpret_cast<const void *>(a4), 8);
+        if (!husk_win_ptr_ok(a2, 8) || !husk_win_ptr_ok(a4, 8)) {
+            return 0xC0000005ULL; // STATUS_ACCESS_VIOLATION (see husk_win_ptr_ok)
+        }
+        memcpy(&base, reinterpret_cast<const void *>(a2), 8);
+        memcpy(&size, reinterpret_cast<const void *>(a4), 8);
         if (!size || size > (1ull << 30)) return 0xC0000017ULL; // NO_MEMORY
         // 16 KiB is this device's page size; rounding here keeps the mapping
         // page-aligned without depending on the M7 section's constant.
@@ -923,6 +940,9 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         const uint64_t outb = g_vmem_base, outsz = want;
         if (a2) memcpy(reinterpret_cast<void *>(a2), &outb, 8);
         if (a4) memcpy(reinterpret_cast<void *>(a4), &outsz, 8);
+        // Unbuffered trace as well: if the guest dies later, the buffered
+        // fprintf above may be lost, but write(2) lines are already in the log.
+        husk_pe_trace("m8b-alloc", outb, outsz);
         fprintf(stderr,
                 "[husk-m8b] alloc base=0x%llx size=0x%llx type=0x%llx prot=0x%llx\n",
                 (unsigned long long)outb, (unsigned long long)outsz,
@@ -931,8 +951,11 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
     }
     case 80: { // NtProtectVirtualMemory(handle,*base,*size,new_prot,*old_prot)
         uint64_t base = 0, size = 0;
-        if (a2) memcpy(&base, reinterpret_cast<const void *>(a2), 8);
-        if (a3) memcpy(&size, reinterpret_cast<const void *>(a3), 8);
+        if (!husk_win_ptr_ok(a2, 8) || !husk_win_ptr_ok(a3, 8)) {
+            return 0xC0000005ULL;
+        }
+        memcpy(&base, reinterpret_cast<const void *>(a2), 8);
+        memcpy(&size, reinterpret_cast<const void *>(a3), 8);
         const uint64_t oldp = husk_win_stack_arg(frame, 5);
         if (!base || !size) return 0xC000000DULL; // INVALID_PARAMETER
         if (::mprotect(reinterpret_cast<void *>(base), static_cast<size_t>(size),
@@ -948,8 +971,11 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
     }
     case 30: { // NtFreeVirtualMemory(handle,*base,*size,type)
         uint64_t base = 0, size = 0;
-        if (a2) memcpy(&base, reinterpret_cast<const void *>(a2), 8);
-        if (a3) memcpy(&size, reinterpret_cast<const void *>(a3), 8);
+        if (!husk_win_ptr_ok(a2, 8) || !husk_win_ptr_ok(a3, 8)) {
+            return 0xC0000005ULL;
+        }
+        memcpy(&base, reinterpret_cast<const void *>(a2), 8);
+        memcpy(&size, reinterpret_cast<const void *>(a3), 8);
         if (!base || !size) return 0xC000000DULL;
         // Read the pattern the guest wrote BEFORE unmapping: this is the proof
         // that guest stores really landed in the host mapping.
@@ -958,6 +984,7 @@ static uint64_t husk_win_dispatch(FEXCore::Core::CpuStateFrame *frame,
         if (::munmap(reinterpret_cast<void *>(base), static_cast<size_t>(size)) == 0) {
             g_vmem_free_ok = 1;
         }
+        husk_pe_trace("m8b-free", base, size);
         fprintf(stderr,
                 "[husk-m8b] free base=0x%llx size=0x%llx pattern=%u type=0x%llx\n",
                 (unsigned long long)base, (unsigned long long)size,
@@ -1280,88 +1307,74 @@ static bool husk_m8a_write_stub(uint8_t *base, size_t map_size,
 #define HUSK_M8B_MEM_RELEASE 0x8000ull
 
 static bool husk_m8b_write_stub(uint8_t *base, size_t map_size) {
+    // NO slots in this page: page 271 is RX, so a host memcpy into it would
+    // fault (that is exactly what killed the first M8b run: the probe died with
+    // no guest-exit trace and no .ips because the store hit a read-only page).
+    // Everything the syscall writes back lives on the guest stack instead --
+    // which is also what real Windows code does.
     static const uint8_t tmpl[] = {
-        0x48, 0x83, 0xEC, 0x60,                   // sub rsp, 0x60
-        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1 (pseudo handle)
-        0x48, 0x8D, 0x15, 0, 0, 0, 0,             // lea rdx, [rip+slot_base]
-        0x45, 0x31, 0xC0,                         // xor r8d, r8d  (ZeroBits)
-        0x4C, 0x8D, 0x0D, 0, 0, 0, 0,             // lea r9,  [rip+slot_size]
+        0x48, 0x83, 0xEC, 0x60,                         // sub rsp, 0x60
+        0x48, 0xC7, 0x44, 0x24, 0x40, 0x00, 0x00, 0x00, 0x00, // [rsp+40] = 0
+        0x48, 0xC7, 0x44, 0x24, 0x48, 0x00, 0x00, 0x01, 0x00, // [rsp+48] = 64 KiB
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,       // mov rcx, -1
+        0x48, 0x8D, 0x54, 0x24, 0x40,                   // lea rdx, [rsp+0x40]
+        0x45, 0x31, 0xC0,                               // xor r8d, r8d
+        0x4C, 0x8D, 0x4C, 0x24, 0x48,                   // lea r9,  [rsp+0x48]
         0x48, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x30, 0x00, 0x00, // [rsp+28]=0x3000
         0x48, 0xC7, 0x44, 0x24, 0x30, 0x04, 0x00, 0x00, 0x00, // [rsp+30]=4
-        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
-        0xB8, 0x18, 0x00, 0x00, 0x00,             // mov eax, 24
-        0x0F, 0x05,                               // syscall
-        0x85, 0xC0,                               // test eax, eax
-        0x75, 0,                                  // jne fail1 (patched)
-        0x48, 0x8B, 0x1D, 0, 0, 0, 0,             // mov rbx, [rip+slot_base]
-        0x48, 0x85, 0xDB,                         // test rbx, rbx
-        0x74, 0,                                  // je fail2 (patched)
-        0xC6, 0x03, 0xAA,                         // mov byte [rbx], 0xAA
-        0xC6, 0x83, 0xF0, 0xFF, 0x00, 0x00, 0x55, // mov byte [rbx+0xFFF0], 0x55
-        0x80, 0x3B, 0xAA,                         // cmp byte [rbx], 0xAA
-        0x75, 0,                                  // jne fail3 (patched)
-        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
-        0x48, 0x8D, 0x15, 0, 0, 0, 0,             // lea rdx, [rip+slot_base]
-        0x4C, 0x8D, 0x0D, 0, 0, 0, 0,             // lea r8,  [rip+slot_size]
-        0x41, 0xB9, 0x00, 0x80, 0x00, 0x00,       // mov r9d, 0x8000
-        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
-        0xB8, 0x1E, 0x00, 0x00, 0x00,             // mov eax, 30
-        0x0F, 0x05,                               // syscall
-        0x85, 0xC0,                               // test eax, eax
-        0x75, 0,                                  // jne fail4 (patched)
-        0xBB, 0x2A, 0x00, 0x00, 0x00,             // mov ebx, 42
-        0xEB, 0,                                  // jmp exit (patched)
-        0xBB, 0xDC, 0x00, 0x00, 0x00,             // fail1: mov ebx, 220
-        0xEB, 0,                                  // jmp exit (patched)
-        0xBB, 0xDD, 0x00, 0x00, 0x00,             // fail2: mov ebx, 221
-        0xEB, 0,                                  // jmp exit (patched)
-        0xBB, 0xDE, 0x00, 0x00, 0x00,             // fail3: mov ebx, 222
-        0xEB, 0,                                  // jmp exit (patched)
-        0xBB, 0xDF, 0x00, 0x00, 0x00,             // fail4: mov ebx, 223
+        0x4C, 0x8B, 0xD1,                               // mov r10, rcx
+        0xB8, 0x18, 0x00, 0x00, 0x00,                   // mov eax, 24
+        0x0F, 0x05,                                     // syscall
+        0x85, 0xC0,                                     // test eax, eax
+        0x75, 0,                                        // jne fail1
+        0x48, 0x8B, 0x5C, 0x24, 0x40,                   // mov rbx, [rsp+0x40]
+        0x48, 0x85, 0xDB,                               // test rbx, rbx
+        0x74, 0,                                        // je fail2
+        0xC6, 0x03, 0xAA,                               // mov byte [rbx], 0xAA
+        0xC6, 0x83, 0xF0, 0xFF, 0x00, 0x00, 0x55,       // mov byte [rbx+0xFFF0], 0x55
+        0x80, 0x3B, 0xAA,                               // cmp byte [rbx], 0xAA
+        0x75, 0,                                        // jne fail3
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,       // mov rcx, -1
+        0x48, 0x8D, 0x54, 0x24, 0x40,                   // lea rdx, [rsp+0x40]
+        0x4C, 0x8D, 0x44, 0x24, 0x48,                   // lea r8,  [rsp+0x48]
+        0x41, 0xB9, 0x00, 0x80, 0x00, 0x00,             // mov r9d, 0x8000
+        0x4C, 0x8B, 0xD1,                               // mov r10, rcx
+        0xB8, 0x1E, 0x00, 0x00, 0x00,                   // mov eax, 30
+        0x0F, 0x05,                                     // syscall
+        0x85, 0xC0,                                     // test eax, eax
+        0x75, 0,                                        // jne fail4
+        0xBB, 0x2A, 0x00, 0x00, 0x00,                   // mov ebx, 42
+        0xEB, 0,                                        // jmp exit
+        0xBB, 0xDC, 0x00, 0x00, 0x00,                   // fail1: mov ebx, 220
+        0xEB, 0,                                        // jmp exit
+        0xBB, 0xDD, 0x00, 0x00, 0x00,                   // fail2: mov ebx, 221
+        0xEB, 0,                                        // jmp exit
+        0xBB, 0xDE, 0x00, 0x00, 0x00,                   // fail3: mov ebx, 222
+        0xEB, 0,                                        // jmp exit
+        0xBB, 0xDF, 0x00, 0x00, 0x00,                   // fail4: mov ebx, 223
         // exit: NtTerminateProcess(-1, ebx)
-        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
-        0x89, 0xDA,                               // mov edx, ebx
-        0x4C, 0x8B, 0xD1,                         // mov r10, rcx
-        0xB8, 0x2C, 0x00, 0x00, 0x00,             // mov eax, 44
-        0x0F, 0x05,                               // syscall
-        0x0F, 0x0B,                               // ud2 (unreachable)
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,       // mov rcx, -1
+        0x89, 0xDA,                                     // mov edx, ebx
+        0x4C, 0x8B, 0xD1,                               // mov r10, rcx
+        0xB8, 0x2C, 0x00, 0x00, 0x00,                   // mov eax, 44
+        0x0F, 0x05,                                     // syscall
+        0x0F, 0x0B,                                     // ud2 (unreachable)
     };
-    if ((uint64_t)HUSK_M7C_STUB_RVA + HUSK_M8B_SLOT_SIZE + 16 > map_size) {
-        set_err("M8b: thunk + slots do not fit the tail page"); return false;
+    if ((uint64_t)HUSK_M7C_STUB_RVA + sizeof(tmpl) > map_size) {
+        set_err("M8b: thunk does not fit the tail page"); return false;
     }
     uint8_t *stub = base + HUSK_M7C_STUB_RVA;
     memcpy(stub, tmpl, sizeof(tmpl));
-
-    struct Patch { uint32_t at; int64_t target; uint32_t next; };
-    const Patch patches[] = {
-        {0x0E, (int64_t)HUSK_M8B_SLOT_BASE, 0x12},   // lea rdx, [rip+base]
-        {0x18, (int64_t)HUSK_M8B_SLOT_SIZE, 0x1C},   // lea r9,  [rip+size]
-        {0x3F, (int64_t)HUSK_M8B_SLOT_BASE, 0x43},   // mov rbx, [rip+base]
-        {0x61, (int64_t)HUSK_M8B_SLOT_BASE, 0x65},   // lea rdx, [rip+base]
-        {0x68, (int64_t)HUSK_M8B_SLOT_SIZE, 0x6C},   // lea r8,  [rip+size]
-    };
-    for (const Patch &q : patches) {
-        const int64_t disp = q.target - (int64_t)q.next;
-        const int32_t d32 = static_cast<int32_t>(disp);
-        memcpy(stub + q.at, &d32, sizeof(d32));
-    }
-    // Short-branch displacements. Each value is (target - next instruction);
-    // check_m8b.py re-derives them from these very constants and disassembles
-    // the result, because being off by one here is invisible without running.
-    stub[0x3B] = static_cast<uint8_t>(0x87 - 0x3C);   // jne fail1  -> 0x87
-    stub[0x47] = static_cast<uint8_t>(0x8E - 0x48);   // je  fail2  -> 0x8E
-    stub[0x56] = static_cast<uint8_t>(0x95 - 0x57);   // jne fail3  -> 0x95
-    stub[0x7F] = static_cast<uint8_t>(0x9C - 0x80);   // jne fail4  -> 0x9C
-    stub[0x86] = static_cast<uint8_t>(0xA1 - 0x87);   // jmp exit (success)
-    stub[0x8D] = static_cast<uint8_t>(0xA1 - 0x8E);   // jmp exit (fail1)
-    stub[0x94] = static_cast<uint8_t>(0xA1 - 0x95);   // jmp exit (fail2)
-    stub[0x9B] = static_cast<uint8_t>(0xA1 - 0x9C);   // jmp exit (fail3)
-    // fail4 falls straight through into exit, so it needs no jump at all.
-
-    // *RegionSize is an INPUT: seed it with the size the probe asks for.
-    const uint64_t zero = 0, want = HUSK_M8B_SIZE;
-    memcpy(stub + HUSK_M8B_SLOT_BASE, &zero, 8);
-    memcpy(stub + HUSK_M8B_SLOT_SIZE, &want, 8);
+    // Short branches: (target - next instruction). check_m8b.py re-derives and
+    // disassembles these, because an off-by-one here is invisible until runtime.
+    stub[0x49] = static_cast<uint8_t>(0x8F - 0x4A);   // jne fail1
+    stub[0x53] = static_cast<uint8_t>(0x96 - 0x54);   // je  fail2
+    stub[0x62] = static_cast<uint8_t>(0x9D - 0x63);   // jne fail3
+    stub[0x87] = static_cast<uint8_t>(0xA4 - 0x88);   // jne fail4
+    stub[0x8E] = static_cast<uint8_t>(0xA9 - 0x8F);   // jmp exit (success)
+    stub[0x95] = static_cast<uint8_t>(0xA9 - 0x96);   // jmp exit (fail1)
+    stub[0x9C] = static_cast<uint8_t>(0xA9 - 0x9D);   // jmp exit (fail2)
+    stub[0xA3] = static_cast<uint8_t>(0xA9 - 0xA4);   // jmp exit (fail3)
     return true;
 }
 
@@ -1722,7 +1735,8 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
                     (unsigned long long)reinterpret_cast<uint64_t>(base));
         } else if (stage == HUSK_M8B_VMEM) {
             if (!husk_m8b_write_stub(base, map_size)) return -61;
-            husk_pe_trace("m8b-stub", HUSK_M7C_STUB_RVA, 0xb6);
+            g_stub_page = reinterpret_cast<uint64_t>(base) + HUSK_M7C_STUB_RVA;
+            husk_pe_trace("m8b-stub", HUSK_M7C_STUB_RVA, 0xbe);
         } else {
             if (!husk_m7c_write_stub(base, map_size)) return -55;
             husk_pe_trace("m7c-stub", HUSK_M7C_STUB_RVA, 0x62);
@@ -1809,6 +1823,11 @@ static int64_t husk_m7_load(const uint8_t *file, size_t n, int stage) {
                 (unsigned)g_vmem_pattern_ok, (unsigned)g_vmem_free_ok,
                 (unsigned)!still, (unsigned long long)g_vmem_base,
                 (unsigned long long)g_vmem_size);
+        if (g_win_bad_ptr) {
+            set_err("M8b: guest passed a pointer into the RX thunk page "
+                    "(host write refused)");
+            return -63;
+        }
         if (rc != 42) {
             // 220 alloc status, 221 null base, 222 pattern read-back, 223 free.
             set_err("M8b: guest virtual-memory path returned exit=%lld (want 42)",
